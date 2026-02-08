@@ -109,3 +109,21 @@ def _clean_adaptive_kwargs(adaptive_kwargs: dict) -> dict:
     }
     return {k: v for k, v in (adaptive_kwargs or {}).items() if k not in RESERVED}
 
+def print_sweep_table(all_metrics):
+    print("\nthr    exit%   overall%  exit_acc%  non_exit_acc%  m_mean  m_p95   m_exit_p95  m_non_exit_p95  exited  non_exited")
+    print("-"*86)
+    for m in all_metrics:
+        print(
+            f"{m['thr']:<5.2f}  "
+            f"{m['exit_rate']*100:>6.2f}  "
+            f"{m['overall_acc']*100:>8.2f}  "
+            f"{m['exited_acc']*100:>9.2f}  "
+            f"{m['non_exited_acc']*100:>13.2f}  "
+            f"{m['margin_mean']:>6.2f}  "
+            f"{m['margin_p95']:>6.2f}  "
+            f"{m['margin_exit_p95']:>11.2f}  "
+            f"{m['margin_non_exit_p95']:>15.2f}  "
+            f"{m['exited_total']:>7d}  "
+            f"{m['non_exited_total']:>10d}"
+        )
+    print()

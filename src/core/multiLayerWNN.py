@@ -97,24 +97,24 @@ class MultiLayerWNN(nn.Module):
             h_list.append(h)
 
             if li == 0:
-                # after first LUT
+                # --- select dims ---
                 if hasattr(self, "exit1_keep_idx") and self.exit1_keep_idx is not None:
                     h_exit = h[:, self.exit1_keep_idx]
-                    
                 else:
                     h_exit = h
 
-                h_exit = (h_exit - self.exit1_mu) / self.exit1_sigma
-                exit1_logits = self.exit1_classifier(h_exit) / self.exit_tau
-                # 這裡假設 exit1_classifier 已經對應 h_exit 的維度
+                # --- normalize if available ---
+                if hasattr(self, "exit1_mu") and hasattr(self, "exit1_sigma") and (self.exit1_mu is not None) and (self.exit1_sigma is not None):
+                    h_exit = (h_exit - self.exit1_mu) / self.exit1_sigma
+
+                # --- exit logits ---
                 exit1_logits = self.exit1_classifier(h_exit) / self.exit_tau
 
-        # final
+        # final logits
         if self.keep_idx is not None:
             h_used = h[:, self.keep_idx]
         else:
             h_used = h
         final_logits = self.classifier(h_used) / self.tau
-        return final_logits, exit1_logits, h_list
 
-   
+        return final_logits, exit1_logits, h_list

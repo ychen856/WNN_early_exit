@@ -16,6 +16,7 @@ def eval_exit1_epoch(model, loader, device):
         pred = exit1_logits.argmax(dim=-1)
         correct += (pred == yb).sum().item()
         total += xb.size(0)
+
     return total_loss / total, correct / total
 
 
@@ -31,6 +32,7 @@ def infer_with_early_exit(model, x_bits, thr=0.3):
     top2 = torch.topk(logits1, k=2, dim=-1).values
 
     margin = top2[:, 0] - top2[:, 1]
+
     exit_mask = margin > thr
     if exit_mask.all():
         return logits1, exit_mask
@@ -42,8 +44,42 @@ def infer_with_early_exit(model, x_bits, thr=0.3):
     logits[exit_mask] = logits1[exit_mask]
     return logits, exit_mask
 
+
 @torch.no_grad()
-def eval_epoch_w_exit(model, data_loader, device):
+def infer_with_early_exit2(model, x_bits, thr=0.3):
+    model.eval()
+
+    # h1
+    h1 = model.layers[0](x_bits)
+    h1_used = h1[:, model.exit1_keep_idx]
+    h1_norm = (h1_used - model.exit1_mu) / model.exit1_sigma
+
+    logits1 = model.exit1_classifier(h1_norm) / model.exit_tau
+
+    top2 = torch.topk(logits1, k=2, dim=-1).values
+    margin = top2[:, 0] - top2[:, 1]          # [B]
+    exit_mask = margin > thr                  # [B]
+
+    if exit_mask.all():
+        return logits1, exit_mask, margin
+
+    # full path for the rest (你這裡用 layer2 + classifier，跟你原本一致)
+    h2 = model.layers[1](h1)
+    if model.keep_idx is not None:
+        h_used = h2[:, model.keep_idx]
+    else:
+        h_used = h2
+    logits_full = model.classifier(h_used) / model.tau
+
+    # merge
+    logits = logits_full.clone()
+    logits[exit_mask] = logits1[exit_mask]
+    return logits, exit_mask, margin
+
+
+
+@torch.no_grad()
+def eval_epoch_w_exit(model, data_loader, device, thr=0.3):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -54,8 +90,8 @@ def eval_epoch_w_exit(model, data_loader, device):
     for xb, yb in data_loader:
         xb = xb.to(device)
         yb = yb.to(device)
-
-        logits, exit_mask = infer_with_early_exit(model, xb, thr=0.3)
+        
+        logits, exit_mask = infer_with_early_exit(model, xb, thr=thr)
         loss = F.cross_entropy(logits, yb)
 
         preds = logits.argmax(dim=1)
@@ -69,6 +105,56 @@ def eval_epoch_w_exit(model, data_loader, device):
     acc = total_correct / total_samples
     exit_rate = exit_count / sample_count
     return avg_loss, acc, exit_rate
+
+
+@torch.no_grad()
+def eval_epoch_w_exit2(model, data_loader, device, thr=0.3):
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    exit_count = 0
+    sample_count = 0
+    exited_correct = 0
+    exited_total = 0
+    exited_class_histogram = torch.zeros(10, dtype=torch.int64)
+
+    for xb, yb in data_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        
+        logits, exit_mask, _ = infer_with_early_exit2(model, xb, thr=thr)
+        loss = F.cross_entropy(logits, yb)
+
+        preds = logits.argmax(dim=1)
+        exit_count += exit_mask.sum().item()
+        sample_count += exit_mask.numel()
+        total_correct += (preds == yb).sum().item()
+        total_samples += yb.numel()
+        total_loss += loss.item() * yb.numel()
+
+
+
+
+
+        # exited-only accuracy
+        if exit_mask.any():
+            exited_preds = preds[exit_mask]
+            exited_y = yb[exit_mask]
+
+            exited_correct += (exited_preds == exited_y).sum().item()
+            exited_total += exit_mask.sum().item()
+
+            exited_class_histogram += torch.bincount(exited_preds.detach().cpu(), minlength=10)
+            
+
+    avg_loss = total_loss / total_samples
+    acc = total_correct / total_samples
+    exit_rate = exit_count / sample_count
+
+    exited_acc = exited_correct / exited_total if exited_total > 0 else 0.0
+
+    return avg_loss, acc, exit_rate, exited_acc, exited_class_histogram
 
 
 @torch.no_grad()
@@ -180,6 +266,96 @@ def eval_exit_metrics(model, loader, device, thr_list=(0.0, 0.5, 1.0, 2.0, 4.0))
     return results
 
 
+@torch.no_grad()
+def eval_epoch_w_exit_metrics(model, data_loader, device, thr=0.3, num_classes=10):
+    model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    exit_count = 0
+    sample_count = 0
+
+    exited_correct = 0
+    exited_total = 0
+    non_exited_correct = 0
+    non_exited_total = 0
+
+    pred_hist = torch.zeros(num_classes, dtype=torch.int64)
+    true_hist = torch.zeros(num_classes, dtype=torch.int64)
+
+    margins_all = []  # collect on CPU for stats
+
+    for xb, yb in data_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        logits, exit_mask, margin = infer_with_early_exit2(model, xb, thr=thr)
+        loss = F.cross_entropy(logits, yb)
+
+        preds = logits.argmax(dim=1)
+
+        # overall
+        bs = yb.numel()
+        total_loss += loss.item() * bs
+        total_correct += (preds == yb).sum().item()
+        total_samples += bs
+
+        # exit stats
+        exit_count += exit_mask.sum().item()
+        sample_count += exit_mask.numel()
+
+        # exited-only / non-exited-only
+        if exit_mask.any():
+            ep = preds[exit_mask]
+            ey = yb[exit_mask]
+            exited_correct += (ep == ey).sum().item()
+            exited_total += exit_mask.sum().item()
+
+            pred_hist += torch.bincount(ep.detach().cpu(), minlength=num_classes)
+            true_hist += torch.bincount(ey.detach().cpu(), minlength=num_classes)
+
+        non_mask = ~exit_mask
+        if non_mask.any():
+            np = preds[non_mask]
+            ny = yb[non_mask]
+            non_exited_correct += (np == ny).sum().item()
+            non_exited_total += non_mask.sum().item()
+
+        margins_all.append(margin.detach().cpu())
+
+    avg_loss = total_loss / max(total_samples, 1)
+    overall_acc = total_correct / max(total_samples, 1)
+    exit_rate = exit_count / max(sample_count, 1)
+
+    exited_acc = exited_correct / exited_total if exited_total > 0 else 0.0
+    non_exited_acc = non_exited_correct / non_exited_total if non_exited_total > 0 else 0.0
+
+    margins_all = torch.cat(margins_all, dim=0) if len(margins_all) else torch.tensor([])
+    margin_mean = margins_all.mean().item() if margins_all.numel() else 0.0
+    margin_p95 = torch.quantile(margins_all, 0.95).item() if margins_all.numel() else 0.0
+    margin_exit_p95 = torch.quantile(margins_all[margins_all > thr], 0.95).item() if (margins_all.numel() and (margins_all > thr).any()) else 0.0
+    margin_non_exit_p95 = torch.quantile(margins_all[margins_all <= thr], 0.95).item() if (margins_all.numel() and (margins_all <= thr).any()) else 0.0 
+
+
+    metrics = {
+        "thr": float(thr),
+        "loss": float(avg_loss),
+        "overall_acc": float(overall_acc),
+        "exit_rate": float(exit_rate),
+        "exited_acc": float(exited_acc),
+        "non_exited_acc": float(non_exited_acc),
+        "margin_mean": float(margin_mean),
+        "margin_p95": float(margin_p95),
+        "margin_exit_p95": float(margin_exit_p95),
+        "margin_non_exit_p95": float(margin_non_exit_p95),
+        "pred_hist": pred_hist,
+        "true_hist": true_hist,
+        "exited_total": int(exited_total),
+        "non_exited_total": int(non_exited_total),
+    }
+    return metrics
 
 
 # -----------------------------

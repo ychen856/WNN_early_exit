@@ -289,6 +289,8 @@ if __name__ == "__main__":
                                        test_labels_filepath)
     (x_train, y_train), (x_test, y_test) = mnist_dataloader.load_data()
 
+    g = torch.Generator().manual_seed(42)
+    y_train_perm = y_train[torch.randperm(len(y_train), generator=g)]
 
 
     # CPU or GPU
@@ -303,31 +305,25 @@ if __name__ == "__main__":
     x_train_bits = dt_thermometer_encode(x_train.to(device), thresholds, xmin, xmax)
     x_test_bits   = dt_thermometer_encode(x_test.to(device),   thresholds, xmin, xmax)
 
-    '''# normalize & encode
-    x_train_norm = minmax_normalize(x_train)
-    x_val_norm   = minmax_normalize(x_test)
-
-    x_train_bits = thermometer_encode(x_train_norm, z=z)
-    x_val_bits   = thermometer_encode(x_val_norm, z=z)'''
-
-
     in_bits = x_train_bits.size(1)
 
-    
-    train_ds = TensorDataset(x_train_bits, y_train)
+    train_ds = TensorDataset(x_train_bits, y_train_perm)
     total_size = len(train_ds)
     val_size = int(0.1 * total_size)
-    train_size = total_size - val_size
+    test_perm_size = int(0.1 * total_size)
+    train_size = total_size - val_size - test_perm_size
     seed = torch.Generator().manual_seed(42)
-    train_ds, val_ds = random_split(
+    train_ds, val_ds, test_perm_ds = random_split(
         train_ds, 
-        [train_size, val_size], 
+        [train_size, val_size, test_perm_size], 
         generator=seed
     )
+
     
     test_ds   = TensorDataset(x_test_bits, y_test)
-    train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
-    val_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
+    perm_train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
+    perm_val_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
+    perm_test_loader   = DataLoader(test_perm_ds, batch_size=512, shuffle=False)
     test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)
 
 
@@ -347,12 +343,19 @@ if __name__ == "__main__":
     # load pre-trained unpruned model  
     model.load_state_dict(torch.load("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_unpruned.pth", map_location=device), strict=False)
     # baseline
-    train_loss_before, train_acc_before = eval_epoch(model, train_loader, device)
+    train_loss_before, train_acc_before = eval_epoch(model, perm_train_loader, device)
     test_loss_before,  test_acc_before  = eval_epoch(model, test_loader,  device)
-    print(f"[Before pruning] train_acc={train_acc_before*100:.2f}%, "
-        f"test_acc={test_acc_before*100:.2f}%")
-    
-    stats = analyze_h1_stats(model, train_loader, device, num_batches=20, thr=0.5)
+    # A-world: train_loader has permuted labels
+    train_loss_perm, train_acc_perm = eval_epoch(model, perm_train_loader, device)
+    print(f"[perm world sanity] final-vs-perm-label train_acc={train_acc_perm*100:.2f}% (expected ~10%)")
+
+    # true-label sanity on standard test set (should stay high)
+    test_loss_true, test_acc_true = eval_epoch(model, test_loader, device)
+    print(f"[true-label sanity] backbone final test_acc={test_acc_true*100:.2f}% (should match pretrained)")
+
+    # NOTE: this function is UNSUPERVISED: it must not use labels (yb)
+    # If loader yields (xb, yb), we ignore yb by design.
+    stats = analyze_h1_stats(model, perm_train_loader, device, num_batches=20, thr=0.5)
     print('stats:', stats)
 
     # override exit1 classifier and keep_idx
@@ -364,23 +367,11 @@ if __name__ == "__main__":
     K = 1024
     exit1_keep_idx = torch.topk(score, k=K).indices.to(device)
 
-    '''clf, res = run_cached_exit_pipeline(
-    model=model,
-    train_loader=train_loader,
-    val_loader=test_loader,     # 先偷懶用 test 當 val 也行（只為了看收斂）
-    test_loader=test_loader,
-    device=device,
-    exit1_keep_idx=exit1_keep_idx,
-    num_classes=10,
-    normalize=True,
-    num_epochs=50,
-    lr=3e-3,
-    weight_decay=1e-4,
-    thr_list=(0.0, 0.5, 1.0, 2.0, 4.0),
-    )'''
 
+    # NOTE: this function is UNSUPERVISED: it must not use labels (yb)
+    # If loader yields (xb, yb), we ignore yb by design.
     _, _, mu, sigma = cache_exit1_features(
-        model, train_loader, device, exit1_keep_idx,
+        model, perm_train_loader, device, exit1_keep_idx,
         max_batches=None, normalize=True
     )
 
@@ -390,9 +381,14 @@ if __name__ == "__main__":
     model.exit1_classifier = torch.nn.Linear(K, 10, bias=True).to(device)
 
     # start training exit head
-    model = train_exit_head(model, train_loader, val_loader, device, num_epochs=30, base_lr=1e-3, weight_decay=1e-4) # 1e-2
-    torch.save(model.state_dict(), "/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_w_exit_head.pth")
+    model = train_exit_head(model, perm_train_loader, perm_val_loader, device, num_epochs=30, base_lr=1e-3, weight_decay=1e-4) # 1e-2
 
+    exit_loss, exit_acc = eval_exit1_epoch(model, perm_test_loader, device)
+    print(f"[Exit head only] test_perm_acc={exit_acc*100:.2f}%")
+
+
+    #sanity check
+    print(f'sanity check on true labels:')
     for thr in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5, 6.0]:
          print(f"--- Evaluate early exit with thr={thr} ---")
          avg_loss, acc, exit_rate = eval_epoch_w_exit(model, test_loader, device, thr=thr)
@@ -420,5 +416,6 @@ if __name__ == "__main__":
     best = all_metrics[3]
     print("pred_hist:", best["pred_hist"])
     print("true_hist:", best["true_hist"])
+
 
     
