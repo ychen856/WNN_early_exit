@@ -351,6 +351,33 @@ def eval_exit1_epoch(model, loader, device):
     return total_loss / total, correct / total
 
 
+
+@torch.no_grad()
+def infer_with_external_exit(model, exit_head, x_bits, layer_idx: int, thr: float):
+    model.eval()
+    exit_head.eval()
+
+    # compute hidden up to that layer (最簡單：用 forward_with_all_hidden；之後再做 partial forward 優化)
+    _, h_list = model.forward_with_all_hidden(x_bits)
+    h = h_list[layer_idx]
+    logits_exit = exit_head(h)
+
+    p = torch.softmax(logits_exit, dim=-1)
+    top2 = torch.topk(p, k=2, dim=-1).values
+    margin = top2[:, 0] - top2[:, 1]
+    exit_mask = margin > thr
+
+    if exit_mask.all():
+        return logits_exit, exit_mask
+
+    logits_full = model(x_bits)
+    logits = logits_full.clone()
+    logits[exit_mask] = logits_exit[exit_mask]
+    return logits, exit_mask
+
+
+
+
 @torch.no_grad()
 def infer_with_early_exit_margin(
     model: nn.Module,

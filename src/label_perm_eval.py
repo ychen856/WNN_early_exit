@@ -387,7 +387,7 @@ if __name__ == "__main__":
     print(f"[Exit head only] test_perm_acc={exit_acc*100:.2f}%")
 
 
-    #sanity check
+    '''#sanity check
     print(f'sanity check on true labels:')
     for thr in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5, 6.0]:
          print(f"--- Evaluate early exit with thr={thr} ---")
@@ -415,7 +415,18 @@ if __name__ == "__main__":
     # 如果你想看某個 thr 的 exited pred/true 分佈（例如最佳點 thr=1.5）
     best = all_metrics[3]
     print("pred_hist:", best["pred_hist"])
-    print("true_hist:", best["true_hist"])
+    print("true_hist:", best["true_hist"])'''
+
+    thr_list = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0]
+    out = stage2_sweep_val_test(model, perm_val_loader, test_loader, device, thr_list)
+
+    # final evaluation on test
+    exit_loss, exit_acc = eval_exit1_epoch(model, test_loader, device)
+    print(f"[G0 Exit head only] test_acc={exit_acc*100:.2f}%")
+    final_acc = eval_final_acc(model, test_loader, device)
+    print(f"[G0 Final head only] test_acc={final_acc*100:.2f}%")
+    m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
+    print(f"[G0 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
 
 
     
