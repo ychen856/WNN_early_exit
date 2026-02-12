@@ -3,12 +3,15 @@ from pathlib import Path
 import json
 import torch
 import torch.nn.functional as F
+import torch.utils.data as d
+from torch.utils.data import DataLoader, random_split
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
+from src.early_exit import eval_exit1_epoch, eval_final_acc, eval_overall_at_thr
 from src.prune import *
 from src.tools.fpga_tools.fpga_export_utils import export_lut_init_files
 from test import *
 from src.core.infer import *
-from src.core.multiLayerWNN import MultiLayerWNN
+from src.core.multiLayerWNN import MultiLayerWNN, save_ckpt
 from src.dataio.encode import minmax_normalize, thermometer_encode, dt_thermometer_encode, compute_dt_thresholds
 from src.tools.fpga_tools.export_fpga_bundle import export_multilayer_2layer_for_fpga, verify_multilayer_export
 from torchvision import transforms
@@ -110,8 +113,6 @@ def collect_hidden_activations(model, data_loader, device):
     return H, Y
 
 
-import numpy as np
-
 def export_wnn_for_fpga(model, path: str, quant_bits: int = None):
     """
     pack the MultiLayerWNNLUT and connection structure into a .npz file,
@@ -156,7 +157,44 @@ def export_wnn_for_fpga(model, path: str, quant_bits: int = None):
 
     np.savez_compressed(path, **export_data)
     print(f"[export_wnn_for_fpga] Saved WNN config to {path}")
+    
 
+'''def save_backbone(path, model, backbone_cfg: dict, extra: dict = None):
+    ckpt = {
+        "format_version": 1,
+        "backbone": backbone_cfg,
+        "model_state": model.state_dict(),
+        "extra": extra or {},
+    }
+    torch.save(ckpt, path)'''
+
+
+'''def load_backbone(path, device):
+    ckpt = torch.load(path, map_location=device)
+
+    # backward-compat: if it's a pure state_dict, throw a helpful error
+    if "config" not in ckpt or "model_state" not in ckpt:
+        raise ValueError(
+            "This checkpoint has no config. Please re-save backbone with save_backbone(...)."
+        )
+
+    cfg = ckpt["config"]
+    model = MultiLayerWNN(
+        in_bits=cfg["in_bits"],
+        num_classes=cfg["num_classes"],
+        lut_input_size=cfg["lut_input_size"],
+        hidden_luts=tuple(cfg["hidden_luts"]),
+        mapping=cfg.get("mapping", None),
+        tau=float(cfg.get("tau", 1.0)),
+    ).to(device)
+
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=True)
+    if len(missing) or len(unexpected):
+        # strict=True normally makes these empty; this is extra paranoia
+        print("[load_backbone] missing:", missing)
+        print("[load_backbone] unexpected:", unexpected)
+
+    return model, cfg, ckpt.get("extra", {})'''
 
 if __name__ == "__main__":
     # load dataset
@@ -171,9 +209,43 @@ if __name__ == "__main__":
                                        test_labels_filepath)
     (x_train, y_train), (x_test, y_test) = mnist_dataloader.load_data()
 
+    total_size = len(x_train)
+    val_size = int(0.1 * total_size)
+    train_size = total_size - val_size
+    seed = torch.Generator().manual_seed(42)
 
+    train_ds, val_ds = random_split(
+        TensorDataset(x_train, y_train),
+        [train_size, val_size], 
+        generator=seed
+    )
+    (x_train, y_train) = train_ds.dataset[train_ds.indices]
+    (x_val, y_val) = val_ds.dataset[val_ds.indices]
 
+    print('train_ds', train_ds)
     # CPU or GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    z = 32  # 16 / 32 / 64
+    # oneshot: use the training dataset, calculate DT thresholds + normalization
+    thresholds, xmin, xmax = compute_dt_thresholds(x_train, z=z)
+
+    # Encode train / test
+    x_train_bits = dt_thermometer_encode(x_train.to(device), thresholds, xmin, xmax)
+    x_val_bits   = dt_thermometer_encode(x_val.to(device),   thresholds, xmin, xmax)
+    x_test_bits   = dt_thermometer_encode(x_test.to(device),   thresholds, xmin, xmax)
+
+    in_bits = x_train_bits.size(1)
+
+    
+    train_ds = TensorDataset(x_train_bits, y_train)
+    val_ds = TensorDataset(x_val_bits, y_val)
+    test_ds   = TensorDataset(x_test_bits, y_test)
+    train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
+    val_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
+    test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)
+
+    '''# CPU or GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     
@@ -185,35 +257,47 @@ if __name__ == "__main__":
     x_train_bits = dt_thermometer_encode(x_train.to(device), thresholds, xmin, xmax)
     x_test_bits   = dt_thermometer_encode(x_test.to(device),   thresholds, xmin, xmax)
 
-    '''# normalize & encode
-    x_train_norm = minmax_normalize(x_train)
-    x_val_norm   = minmax_normalize(x_test)
-
-    x_train_bits = thermometer_encode(x_train_norm, z=z)
-    x_val_bits   = thermometer_encode(x_val_norm, z=z)'''
-
 
     in_bits = x_train_bits.size(1)
 
     train_ds = TensorDataset(x_train_bits, y_train)
     val_ds   = TensorDataset(x_test_bits, y_test)
     train_loader = DataLoader(train_ds, batch_size=256, shuffle=True)
-    test_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
+    test_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)'''
 
 
     C = 10
 
-    model = MultiLayerWNN(
+    backbone_cfg = dict(
+        arch="MultiLayerWNN",
         in_bits=in_bits,
         num_classes=10,
         lut_input_size=6,
-        hidden_luts=(2000, 1000),  # (2000, 1000)
-        tau=0.165,               # Table 15 x 1/0.165 (~= 0.165)
+        hidden_luts=(2000, 1000),
+        tau=0.165,
+        mapping=None,          # 你如果有第一層 mapping 就放這裡（或放 conn_idx 也行）
+    )
+
+    model = MultiLayerWNN(
+        in_bits=backbone_cfg['in_bits'],
+        num_classes=backbone_cfg['num_classes'],
+        lut_input_size=backbone_cfg['lut_input_size'],
+        hidden_luts=backbone_cfg['hidden_luts'],  # (2000, 1000)
+        tau=backbone_cfg['tau'],               # Table 15 x 1/0.165 (~= 0.165)
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    model = train_model(model, train_loader, test_loader, device, num_epochs=30, base_lr=1e-3)
-    torch.save(model.state_dict(), "/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_unpruned.pth")
+    model = train_model(model, train_loader, val_loader, device, num_epochs=30, base_lr=1e-3)
+    save_ckpt("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_unpruned_v1.pth", model, backbone_cfg, exit_config=None, extra={"dataset": "MNIST"})
+    
 
+    # evaluation
+    train_loss_before, train_acc_before = eval_epoch(model, train_loader, device)
+    val_loss_before, val_acc_before = eval_epoch(model, val_loader, device)
+    test_loss_before,  test_acc_before  = eval_epoch(model, test_loader,  device)
+
+    print(f"[Backbone] train_acc={train_acc_before*100:.2f}% |"
+          f"val_acc={val_acc_before*100:.2f}% | "
+        f"test_acc={test_acc_before*100:.2f}%")
     

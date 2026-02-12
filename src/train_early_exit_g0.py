@@ -8,10 +8,10 @@ import torch.nn.functional as F
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
 from src.prune import *
 from src.early_exit import *
-from src.tools.utils import print_sweep_table  
+from src.tools.utils import print_sweep_table
 from test import *
 from src.core.infer import *
-from src.core.multiLayerWNN import MultiLayerWNN
+from src.core.multiLayerWNN import MultiLayerWNN, load_ckpt, save_ckpt
 from src.dataio.encode import minmax_normalize, thermometer_encode, dt_thermometer_encode, compute_dt_thresholds
 from src.tools.fpga_tools.export_fpga_bundle import export_multilayer_2layer_for_fpga, verify_multilayer_export
 from torchvision import transforms
@@ -275,7 +275,6 @@ def collect_hidden_activations(model, data_loader, device):
     return H, Y
 
 
-
 if __name__ == "__main__":
     # load dataset
     print('data/model initialization...')
@@ -289,9 +288,43 @@ if __name__ == "__main__":
                                        test_labels_filepath)
     (x_train, y_train), (x_test, y_test) = mnist_dataloader.load_data()
 
+    total_size = len(x_train)
+    val_size = int(0.1 * total_size)
+    train_size = total_size - val_size
+    seed = torch.Generator().manual_seed(42)
 
+    train_ds, val_ds = random_split(
+        TensorDataset(x_train, y_train),
+        [train_size, val_size], 
+        generator=seed
+    )
+    (x_train, y_train) = train_ds.dataset[train_ds.indices]
+    (x_val, y_val) = val_ds.dataset[val_ds.indices]
 
+    print('train_ds', train_ds)
     # CPU or GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    z = 32  # 16 / 32 / 64
+    # oneshot: use the training dataset, calculate DT thresholds + normalization
+    thresholds, xmin, xmax = compute_dt_thresholds(x_train, z=z)
+
+    # Encode train / test
+    x_train_bits = dt_thermometer_encode(x_train.to(device), thresholds, xmin, xmax)
+    x_val_bits   = dt_thermometer_encode(x_val.to(device),   thresholds, xmin, xmax)
+    x_test_bits   = dt_thermometer_encode(x_test.to(device),   thresholds, xmin, xmax)
+
+    in_bits = x_train_bits.size(1)
+
+    
+    train_ds = TensorDataset(x_train_bits, y_train)
+    val_ds = TensorDataset(x_val_bits, y_val)
+    test_ds   = TensorDataset(x_test_bits, y_test)
+    train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
+    val_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
+    test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)
+
+    '''# CPU or GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     
@@ -302,13 +335,6 @@ if __name__ == "__main__":
     # Encode train / test
     x_train_bits = dt_thermometer_encode(x_train.to(device), thresholds, xmin, xmax)
     x_test_bits   = dt_thermometer_encode(x_test.to(device),   thresholds, xmin, xmax)
-
-    '''# normalize & encode
-    x_train_norm = minmax_normalize(x_train)
-    x_val_norm   = minmax_normalize(x_test)
-
-    x_train_bits = thermometer_encode(x_train_norm, z=z)
-    x_val_bits   = thermometer_encode(x_val_norm, z=z)'''
 
 
     in_bits = x_train_bits.size(1)
@@ -328,10 +354,10 @@ if __name__ == "__main__":
     test_ds   = TensorDataset(x_test_bits, y_test)
     train_loader = DataLoader(train_ds, batch_size=256, shuffle=False)
     val_loader   = DataLoader(val_ds, batch_size=512, shuffle=False)
-    test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)
+    test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)'''
 
 
-    C = 10
+    '''C = 10
 
     model = MultiLayerWNN(
         in_bits=in_bits,
@@ -341,29 +367,28 @@ if __name__ == "__main__":
         tau=0.165,               # Table 15 x 1/0.165 (~= 0.165)
         exit_tau=1,          # exit head temperature
     ).to(device)
+
+
     
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # load pre-trained unpruned model  
     model.load_state_dict(torch.load("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_unpruned.pth", map_location=device), strict=False)
+    '''
+    model, bb_cfg, ex_cfg, _ = load_ckpt("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_unpruned_v1.pth", device)
+    
     # baseline
     train_loss_before, train_acc_before = eval_epoch(model, train_loader, device)
+    val_loss_before, val_acc_before = eval_epoch(model, val_loader, device)
     test_loss_before,  test_acc_before  = eval_epoch(model, test_loader,  device)
-    print(f"[Before pruning] train_acc={train_acc_before*100:.2f}%, "
+
+    print(f"[Backbone] train_acc={train_acc_before*100:.2f}% |"
+          f"val_acc={val_acc_before*100:.2f}% | "
         f"test_acc={test_acc_before*100:.2f}%")
     
-    stats = analyze_h1_stats(model, train_loader, device, num_batches=20, thr=0.5)
-    print('stats:', stats)
+    
 
-    # override exit1 classifier and keep_idx
-    # stats 是你 analyze_h1_stats 回傳的 dict
-    p = stats["p1_per_dim"]           # [2000]
-    s = stats["std_per_dim"]          # [2000]
-
-    score = (p * (1 - p)) * s         # [2000]
-    K = 1024
-    exit1_keep_idx = torch.topk(score, k=K).indices.to(device)
-
+    # calculate stats and decide exit1_keep_idx
     '''clf, res = run_cached_exit_pipeline(
     model=model,
     train_loader=train_loader,
@@ -378,22 +403,51 @@ if __name__ == "__main__":
     weight_decay=1e-4,
     thr_list=(0.0, 0.5, 1.0, 2.0, 4.0),
     )'''
+    stats = analyze_h1_stats(model, train_loader, device, num_batches=20, thr=0.5)
+    print('stats:', stats)
+
+    # override exit1 classifier and keep_idx
+    # stats 是你 analyze_h1_stats 回傳的 dict
+    p = stats["p1_per_dim"]           # [2000]
+    s = stats["std_per_dim"]          # [2000]
+
+    score = (p * (1 - p)) * s         # [2000]
+    K = 1024
+    exit1_keep_idx = torch.topk(score, k=K).indices.to(device)
+
 
     _, _, mu, sigma = cache_exit1_features(
         model, train_loader, device, exit1_keep_idx,
         max_batches=None, normalize=True
     )
 
-    model.register_buffer("exit1_keep_idx", exit1_keep_idx)
+
+    # compute exit1_keep_idx / mu / sigma 之後：
+    model.register_buffer("exit1_keep_idx", exit1_keep_idx.to(device))
     model.register_buffer("exit1_mu", mu.to(device))
     model.register_buffer("exit1_sigma", sigma.to(device))
-    model.exit1_classifier = torch.nn.Linear(K, 10, bias=True).to(device)
+
+    model.enable_exit1(K=exit1_keep_idx.numel(), num_classes=10, bias=True, exit_tau=1.0, device=device)
+
 
     # start training exit head
     model = train_exit_head(model, train_loader, val_loader, device, num_epochs=30, base_lr=1e-3, weight_decay=1e-4) # 1e-2
-    torch.save(model.state_dict(), "/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_w_exit_head.pth")
+    
+    exit_cfg = dict(
+        enabled=True,
+        at_layer=0,          # after first LUT
+        K=K,
+        use_norm=True,
+        exit_tau=1.0,
+        head_type="linear",  # 之後要加 LUT head / MLP 也可以改這裡
+        gate="logit_margin",
+    )
 
-    for thr in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5, 6.0]:
+
+    save_ckpt("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_w_exit_g0_v1.pth", model, bb_cfg, exit_cfg)
+
+
+    '''for thr in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5, 6.0]:
          print(f"--- Evaluate early exit with thr={thr} ---")
          avg_loss, acc, exit_rate = eval_epoch_w_exit(model, test_loader, device, thr=thr)
          print(f"thr={thr}, test_acc={acc*100:.2f}%, exit_rate={exit_rate*100:.2f}%")
@@ -419,6 +473,15 @@ if __name__ == "__main__":
     # 如果你想看某個 thr 的 exited pred/true 分佈（例如最佳點 thr=1.5）
     best = all_metrics[3]
     print("pred_hist:", best["pred_hist"])
-    print("true_hist:", best["true_hist"])
+    print("true_hist:", best["true_hist"])'''
 
-    
+    thr_list = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0]
+    out = stage2_sweep_val_test(model, val_loader, test_loader, device, thr_list)
+
+    # final evaluation on test
+    exit_loss, exit_acc = eval_exit1_epoch(model, test_loader, device)
+    print(f"[G0 Exit head only] test_acc={exit_acc*100:.2f}%")
+    final_acc = eval_final_acc(model, test_loader, device)
+    print(f"[G0 Final head only] test_acc={final_acc*100:.2f}%")
+    m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
+    print(f"[G0 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")

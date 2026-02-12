@@ -1,5 +1,6 @@
 import os
-from typing import List, Tuple
+import torch.nn as nn
+from typing import List, Tuple, Optional, List
 import numpy as np
 
 
@@ -9,6 +10,65 @@ import numpy as np
 # ---------------------------
 # Utilities
 # ---------------------------
+import torch
+
+
+'''def save_checkpoint(path, model, extra: dict = None):
+    # exit info
+    exit_enabled = (model.exit1_classifier is not None)
+    exit_K = None
+    exit_bias = None
+    if exit_enabled:
+        exit_K = model.exit1_classifier.in_features
+        exit_bias = (model.exit1_classifier.bias is not None)
+
+    ckpt = {
+        "model_state": model.state_dict(),   # includes exit buffers if present
+        "config": {
+            "in_bits": model.layer_in_bits[0],
+            "num_classes": model.classifier.out_features,
+            "lut_input_size": model.layers[0].lut_input_size,
+            "hidden_luts": tuple(model.layer_out_luts),
+            "tau": float(model.tau),
+
+            # exit head metadata
+            "exit_enabled": exit_enabled,
+            "exit_K": exit_K,
+            "exit_bias": exit_bias,
+            "exit_tau": float(getattr(model, "exit_tau", 1.0)),
+        }
+    }
+    if extra is not None:
+        ckpt["extra"] = extra
+
+    torch.save(ckpt, path)'''
+
+# -------------------------
+# Utils: exit feature prep
+# -------------------------
+@torch.no_grad()
+def _has_buf(t: Optional[torch.Tensor]) -> bool:
+    return (t is not None) and isinstance(t, torch.Tensor) and (t.numel() > 0)
+
+def get_exit1_features(model: nn.Module, h1: torch.Tensor) -> torch.Tensor:
+    """
+    h1: [B, D1] (output of first LUT layer)
+    Return: h1_exit: [B, K] or [B, D1] depending on keep_idx
+    Applies optional keep_idx selection and optional (mu/sigma) normalization.
+    """
+    h = h1
+    if hasattr(model, "exit1_keep_idx") and _has_buf(model.exit1_keep_idx):
+        h = h[:, model.exit1_keep_idx]
+
+    # optional norm if buffers exist
+    if hasattr(model, "exit1_mu") and hasattr(model, "exit1_sigma"):
+        if _has_buf(model.exit1_mu) and _has_buf(model.exit1_sigma):
+            h = (h - model.exit1_mu) / (model.exit1_sigma + 1e-8)
+
+    return h
+
+
+
 def _assert_power_of_two(a: int):
     if a <= 0 or (a & (a - 1)) != 0:
         raise ValueError(f"Address dimension A={a} is not a power of two.")
@@ -127,3 +187,5 @@ def print_sweep_table(all_metrics):
             f"{m['non_exited_total']:>10d}"
         )
     print()
+
+
