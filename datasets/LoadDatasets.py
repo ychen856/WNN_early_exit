@@ -15,6 +15,11 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 
+def build_loaders(dataset: str, batch_size: int, num_workers: int, seed: int):
+    """
+    return train_loader, val_loader, test_loader, in_bits, num_classes
+    """
+
 #
 # MNIST Data Loader Class
 #
