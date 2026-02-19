@@ -74,7 +74,7 @@ def analyze_hidden_for_exit(model, loader, device, layer_idx: int, thr_bin: floa
     bias = (p1_per_dim - 0.5).abs()
     return mean_per_dim, std_per_dim, p1_per_dim, bias
 
-def select_keep_idx(mean_per_dim, std_per_dim, p1_per_dim, bias, k: int, keep_mode: str):
+def select_exit_keep_idx(mean_per_dim, std_per_dim, p1_per_dim, bias, k: int, keep_mode: str):
     if keep_mode == "bias":
         score = bias
     elif keep_mode == "bias*std":
@@ -86,13 +86,13 @@ def select_keep_idx(mean_per_dim, std_per_dim, p1_per_dim, bias, k: int, keep_mo
     return torch.topk(score, k=k).indices  # [k], CPU long
 
 @torch.no_grad()
-def compute_mu_sigma(model, loader, device, layer_idx: int, keep_idx: torch.Tensor, num_batches: int = None):
+def compute_mu_sigma(model, loader, device, layer_idx: int, exit_keep_idx: torch.Tensor, num_batches: int = None):
     model.eval()
     Hs = []
     for bi, (xb, yb) in enumerate(loader):
         xb = xb.to(device)
         _, h_list = model.forward_with_all_hidden(xb)
-        h = h_list[layer_idx].detach().cpu()[:, keep_idx]
+        h = h_list[layer_idx].detach().cpu()[:, exit_keep_idx]
         Hs.append(h)
         if num_batches is not None and (bi + 1) >= num_batches:
             break

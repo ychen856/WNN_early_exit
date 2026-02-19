@@ -6,7 +6,8 @@ from copy import deepcopy
 from typing import List, Tuple, Optional, List
 
 from src.core.wnnLutLayer import WNNLUTLayer
-from src.tools.utils import get_exit1_features
+from src.exit.ckpt_exit import normalize_exit_cfg_list
+from src.tools.utils import get_exit1_features, make_dropout_schedule
 
 
 class MultiLayerWNN(nn.Module):
@@ -19,6 +20,7 @@ class MultiLayerWNN(nn.Module):
         mapping=None,
         tau: float = 1.0,
         exit_tau: float = 1.0,
+        dropout_p=0.0
     ):
         super().__init__()
         self.tau = tau
@@ -40,21 +42,24 @@ class MultiLayerWNN(nn.Module):
         '''self.register_buffer("exit1_keep_idx", torch.empty(0, dtype=torch.long))
         self.register_buffer("exit1_mu", torch.empty(0))
         self.register_buffer("exit1_sigma", torch.empty(0))'''
-
-
+        # 每層 dropout schedule
+        drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
 
         for i, n_lut in enumerate(hidden_luts):
-            # Use mapping only for the first layer
             layer_mapping = mapping if i == 0 else None
+            binarize_input = (i == 0)
 
             layers.append(
                 WNNLUTLayer(
                     in_bits=prev_bits,
                     num_luts=n_lut,
                     lut_input_size=lut_input_size,
-                    mapping=layer_mapping # <--- PASS IT HERE
+                    mapping=layer_mapping,
+                    binarize_input=binarize_input,
+                    dropout_p=drop_ps[i],
                 )
             )
+
             self.layer_in_bits.append(prev_bits)
             self.layer_out_luts.append(n_lut)
             prev_bits = n_lut
@@ -377,3 +382,66 @@ def load_ckpt(path: str,
 
     return model, bb_cfg, ex_cfg, ckpt.get("extra", {})
 
+def load_ckpt_v2(path, device):
+    ckpt = torch.load(path, map_location=device)
+    backbone_cfg = ckpt["backbone_cfg"]
+    payload_exit_cfg = ckpt.get("exit_cfg", [])
+    exit_cfg_list = normalize_exit_cfg_list(payload_exit_cfg)  # <-- 轉成 ExitConfig list
+
+    # 你原本的 init 邏輯維持：用 backbone_cfg 建 model
+    model = MultiLayerWNN(**backbone_cfg).to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+    extra = ckpt.get("extra", {})
+    return model, backbone_cfg, exit_cfg_list, extra
+
+
+def save_ckpt_v2(path, model, backbone_cfg, exit_cfg_list=None, extra=None):
+    exit_cfg_list = normalize_exit_cfg_list(exit_cfg_list)
+    payload_exit_cfg = [ec.to_payload() for ec in exit_cfg_list]
+
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "backbone_cfg": backbone_cfg,
+        "exit_cfg": payload_exit_cfg,   # <-- 永遠是 payload list
+        "extra": extra or {},
+    }
+    torch.save(ckpt, path)
+
+
+import os
+import shutil
+import torch
+
+def save_best_checkpoint_atomic(
+    path_out: str,
+    model: torch.nn.Module,
+    best_val_acc: float,
+    epoch: int,
+    optimizer=None,
+    scheduler=None,
+    extra: dict = None,
+):
+    """
+    Save checkpoint to a temp file then atomically replace `path_out`.
+    This avoids corrupting `path_out` if interrupted during write.
+    """
+    tmp_path = path_out + ".tmp"
+
+    payload = {
+        "epoch": epoch,
+        "best_val_acc": float(best_val_acc),
+        "model_state": model.state_dict(),
+    }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state"] = scheduler.state_dict()
+    if extra is not None:
+        payload["extra"] = extra
+
+    # write temp
+    torch.save(payload, tmp_path)
+
+    # atomic replace (best effort cross-platform)
+    os.replace(tmp_path, path_out)

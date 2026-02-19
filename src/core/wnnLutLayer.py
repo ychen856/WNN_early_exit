@@ -21,12 +21,16 @@ class WNNLUTLayer(nn.Module):
         mapping=None,
         conn_idx=None,
         init_std: float = 0.01,
+        dropout_p = 0.2,
+        binarize_input = True
     ):
         super().__init__()
 
         self.in_bits = in_bits
         self.num_luts = num_luts
         self.lut_input_size = lut_input_size
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.binarize_input = binarize_input
 
         # -----------------------------
         # 1) Decide connection indices
@@ -76,7 +80,8 @@ class WNNLUTLayer(nn.Module):
         device = x_bits.device
 
         # Binarize input bits to 0/1
-        x_bits = (x_bits > 0.5).float()
+        if self.binarize_input:
+            x_bits = (x_bits > 0.5).float()
 
         # Extract k bits for each LUT
         # conn_idx: [num_luts, k]
@@ -84,6 +89,8 @@ class WNNLUTLayer(nn.Module):
         bits = x_bits[:, self.conn_idx.view(-1)].view(
             B, self.num_luts, self.lut_input_size
         )
+        # ✅ 不管第幾層，用來當 address 的 bits 都要是 0/1
+        bits = (bits > 0.5).to(torch.long)   # 或 .float() 再 long 都行
 
         # idx = (((b0)*2 + b1)*2 + b2)*2 + ...
         idx = torch.zeros(B, self.num_luts, dtype=torch.long, device=device)
@@ -96,4 +103,5 @@ class WNNLUTLayer(nn.Module):
 
         # sigmoid activation (same as PyTorch version   )
         out = torch.sigmoid(out)
+        out = self.dropout(out)
         return out

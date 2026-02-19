@@ -9,6 +9,288 @@ from src.tools.utils import get_exit1_features
 from typing import Dict, List, Tuple
 import torch
 
+from typing import Dict, List, Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def _forward_hidden_upto(model, x_bits: torch.Tensor, layer_idx: int):
+    """
+    Run model.layers[0..layer_idx] (inclusive) and return h at that point.
+    Assumes model.layers is a ModuleList of WNNLUTLayer.
+    """
+    h = x_bits
+    for li in range(layer_idx + 1):
+        h = model.layers[li](h)
+    return h
+
+
+@torch.no_grad()
+def _compute_margin_from_logits(logits: torch.Tensor, use_prob: bool = False):
+    """
+    logits: [B, C]
+    margin = top1 - top2
+    If use_prob=True, compute on softmax probs; else compute directly on logits.
+    """
+    if use_prob:
+        p = torch.softmax(logits, dim=-1)
+        top2 = torch.topk(p, k=2, dim=-1).values
+    else:
+        top2 = torch.topk(logits, k=2, dim=-1).values
+    return top2[:, 0] - top2[:, 1]  # [B]
+
+
+@torch.no_grad()
+def eval_overall_at_thr_multi_exit(
+    model: nn.Module,
+    loader,
+    device,
+    thr: float,
+    *,
+    exit_id: int,
+    exit_cfg_list: List[dict],
+    exit_heads: nn.ModuleList,   # exit_heads[exit_id](features) -> logits
+    use_prob_margin: bool = False,  # 跟舊版一致你可以先用 False
+) -> Dict[str, float]:
+    """
+    Multi-exit version of eval_overall_at_thr.
+
+    Returns:
+      overall_acc
+      exit_rate
+      exited_acc
+      non_exited_acc
+      margin_mean, margin_p95
+      exited, non_exited, total
+    """
+    model.eval()
+
+    cfg = exit_cfg_list[exit_id]
+    layer_idx = int(cfg["layer_idx"])
+    exit_tau = float(cfg.get("exit_tau", 1.0))
+
+    total = 0
+    correct_overall = 0
+
+    exited = 0
+    correct_exited = 0
+    non_exited = 0
+    correct_non_exited = 0
+
+    all_margins = []
+
+    exit_head = exit_heads[exit_id].to(device)
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+
+        # --- final logits (always full model) ---
+        final_logits = model(xb)  # assumes model(x) returns final logits
+
+        # --- exit logits (online) ---
+        h_exit = _forward_hidden_upto(model, xb, layer_idx)  # [B, H]
+
+        exit_logits = exit_head(h_exit) / exit_tau  # [B, C]
+
+        # --- margin + exit decision ---
+        margin = _compute_margin_from_logits(exit_logits, use_prob=use_prob_margin)
+        all_margins.append(margin.detach().cpu())
+
+        exit_mask = margin > thr  # [B]
+
+        # --- mix ---
+        mixed = final_logits.clone()
+        mixed[exit_mask] = exit_logits[exit_mask]
+
+        pred = mixed.argmax(dim=-1)
+        correct_overall += (pred == yb).sum().item()
+        total += yb.numel()
+
+        if exit_mask.any():
+            exited += int(exit_mask.sum().item())
+            pred_exit = exit_logits.argmax(dim=-1)
+            correct_exited += (pred_exit[exit_mask] == yb[exit_mask]).sum().item()
+
+        ne_mask = ~exit_mask
+        if ne_mask.any():
+            non_exited += int(ne_mask.sum().item())
+            pred_full = final_logits.argmax(dim=-1)
+            correct_non_exited += (pred_full[ne_mask] == yb[ne_mask]).sum().item()
+
+    margins = torch.cat(all_margins, dim=0) if len(all_margins) else torch.tensor([])
+    margin_mean = float(margins.mean().item()) if margins.numel() else float("nan")
+    margin_p95 = float(torch.quantile(margins, 0.95).item()) if margins.numel() else float("nan")
+
+    overall_acc = correct_overall / max(total, 1)
+    exit_rate = exited / max(total, 1)
+    exited_acc = correct_exited / max(exited, 1)
+    non_exited_acc = (correct_non_exited / non_exited) if non_exited > 0 else float("nan")
+
+    return {
+        "overall_acc": overall_acc,
+        "exit_rate": exit_rate,
+        "exited_acc": exited_acc,
+        "non_exited_acc": non_exited_acc,
+        "margin_mean": margin_mean,
+        "margin_p95": margin_p95,
+        "exited": exited,
+        "non_exited": non_exited,
+        "total": total,
+    }
+
+
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def _head_logits_from_hidden(head, h, device):
+    """
+    h: [B, D_layer] on device
+    return logits: [B, C] on device
+    """
+    x = h[:, head.exit_keep_idx.to(device)]
+    if getattr(head, "use_norm", False):
+        mu = head.mu.to(device)
+        sigma = head.sigma.to(device)
+        x = (x - mu) / sigma
+    return head.classifier(x) / head.exit_tau
+
+def _margin_from_logits(logits, use_prob=False):
+    if use_prob:
+        p = torch.softmax(logits, dim=-1)
+        top2 = torch.topk(p, k=2, dim=-1).values
+    else:
+        top2 = torch.topk(logits, k=2, dim=-1).values
+    return top2[:, 0] - top2[:, 1]  # [B]
+
+@torch.no_grad()
+def eval_cascade_multi_exit(
+    model, loader, device,
+    exit_heads, exit_cfg_list,
+    thrs,                      # list/tuple length = num_exits (每個 exit 一個 thr)
+    use_prob_margin: bool = False,
+    log_margins: bool = True,
+):
+    """
+    Cascade routing:
+      for i in exits:
+        if margin_i > thr_i => exit at i
+      else => final
+
+    exit_heads[i] <-> exit_cfg_list[i] 對齊
+    exit_cfg_list[i].layer_idx 用來取 h_list[layer_idx]
+    """
+    assert len(exit_heads) == len(exit_cfg_list)
+    assert len(thrs) == len(exit_heads)
+
+    model.eval()
+    for h in exit_heads:
+        h.eval()
+    exit_heads = [h.to(device).eval() for h in exit_heads]
+
+    total = 0
+    correct = 0
+    num_exits = len(exit_heads)
+
+    # per-branch counts: exits + final
+    n_exit = [0] * num_exits
+    c_exit = [0] * num_exits
+    n_final = 0
+    c_final = 0
+
+    # (optional) margin stats per exit
+    margins_per_exit = [[] for _ in range(num_exits)] if log_margins else None
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        B = yb.size(0)
+
+        final_logits, h_list = model.forward_with_all_hidden(xb)
+
+        # 哪些樣本尚未決策（尚未在任何 exit 結束）
+        undecided = torch.ones(B, dtype=torch.bool, device=device)
+
+        preds = torch.empty(B, dtype=torch.long, device=device)
+
+        # 依序嘗試每個 exit
+        for i in range(num_exits):
+            if not undecided.any():
+                break
+
+            cfg = exit_cfg_list[i]
+            head = exit_heads[i]
+
+            h_i = h_list[cfg['layer_idx']]              # [B, D_i]
+            logits_i = _head_logits_from_hidden(head, h_i, device)  # [B, C]
+            m_i = _margin_from_logits(logits_i, use_prob=use_prob_margin)  # [B]
+
+            if log_margins:
+                # 你可以選擇只記 undecided 的 margin；這邊先記全部，方便 debug
+                margins_per_exit[i].append(m_i.detach().cpu())
+
+            take_i = undecided & (m_i > float(thrs[i]))
+            if take_i.any():
+                preds[take_i] = logits_i[take_i].argmax(dim=-1)
+
+                # per-exit stats
+                n_i = take_i.sum().item()
+                n_exit[i] += n_i
+                c_exit[i] += (preds[take_i] == yb[take_i]).sum().item()
+
+                undecided = undecided & (~take_i)
+
+        # 剩下走 final
+        if undecided.any():
+            preds[undecided] = final_logits[undecided].argmax(dim=-1)
+            n_f = undecided.sum().item()
+            n_final += n_f
+            c_final += (preds[undecided] == yb[undecided]).sum().item()
+
+        # overall
+        correct += (preds == yb).sum().item()
+        total += B
+
+    out = {
+        "overall_acc": correct / max(total, 1),
+        "total": total,
+        "exit_rates": [n / max(total, 1) for n in n_exit],
+        "exit_accs": [(c / n) if n > 0 else float("nan") for c, n in zip(c_exit, n_exit)],
+        "final_rate": n_final / max(total, 1),
+        "final_acc": (c_final / n_final) if n_final > 0 else float("nan"),
+    }
+
+    if log_margins:
+        # 每個 exit 各自的 margin mean/p95
+        margin_stats = []
+        for i in range(num_exits):
+            if len(margins_per_exit[i]) == 0:
+                margin_stats.append({"mean": float("nan"), "p95": float("nan")})
+                continue
+            m = torch.cat(margins_per_exit[i], dim=0)
+            margin_stats.append({
+                "mean": float(m.mean().item()),
+                "p95": float(torch.quantile(m, 0.95).item()),
+            })
+        out["margin_stats"] = margin_stats
+
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def sweep_thr_table(
     model,
     loader,

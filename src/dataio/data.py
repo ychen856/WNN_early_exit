@@ -13,6 +13,25 @@ import torchvision.transforms as T
 # from src.encode import compute_dt_thresholds, dt_thermometer_encode
 from src.dataio.encode import dt_thermometer_encode, compute_dt_thresholds
 
+
+import random, numpy as np, torch
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 若你想更硬：某些算子會報錯就關掉
+    # torch.use_deterministic_algorithms(True)
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 @dataclass
 class DatasetMeta:
     name: str
@@ -78,8 +97,10 @@ def build_loaders_bits(
     train_size = total_size - val_size
 
     gen = torch.Generator().manual_seed(seed)
+    
     full_ds = TensorDataset(x_train_u8, y_train)
     train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=gen)
+    
 
     '''full_x, full_y = full_ds.tensors
     x_train_u8 = full_x[train_ds.indices]
@@ -116,12 +137,14 @@ def build_loaders_bits(
         batch_size=batch_size_train,
         shuffle=shuffle_train,
         drop_last=False,
+        generator=gen, num_workers=0
     )
     val_loader = DataLoader(
         TensorDataset(x_val_bits, y_val),
         batch_size=batch_size_eval,
         shuffle=False,
         drop_last=False,
+        num_workers=0
     )
     test_loader = DataLoader(
         TensorDataset(x_test_bits, y_test),

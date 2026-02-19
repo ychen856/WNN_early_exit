@@ -43,6 +43,60 @@ import torch
 
     torch.save(ckpt, path)'''
 
+from typing import List, Sequence, Union
+
+def _parse_float_list(s: Union[str, float, None]) -> List[float]:
+    """
+    Accept:
+      - "0.1" -> [0.1]
+      - "0.1,0.0,0.0" -> [0.1,0.0,0.0]
+      - "0.1x2,0.0x2" -> [0.1,0.1,0.0,0.0]
+      - None -> []
+    """
+    if s is None:
+        return []
+    if isinstance(s, (float, int)):
+        return [float(s)]
+
+    s = str(s).strip()
+    if not s:
+        return []
+
+    out: List[float] = []
+    for part in s.split(","):
+        part = part.strip()
+        if "x" in part:
+            v_str, n_str = part.split("x")
+            v = float(v_str.strip())
+            n = int(n_str.strip())
+            out.extend([v] * n)
+        else:
+            out.append(float(part))
+    return out
+
+
+def make_dropout_schedule(dropout_spec: Union[str, float, None], num_layers: int) -> List[float]:
+    """
+    Returns per-layer dropout probabilities length == num_layers.
+
+    Rules:
+      - if one value: broadcast to all layers
+      - if shorter list: pad with last value
+      - if longer list: truncate
+    """
+    vals = _parse_float_list(dropout_spec)
+    if len(vals) == 0:
+        return [0.0] * num_layers
+
+    if len(vals) == 1:
+        return vals * num_layers
+
+    if len(vals) < num_layers:
+        vals = vals + [vals[-1]] * (num_layers - len(vals))
+
+    return vals[:num_layers]
+
+
 # -------------------------
 # Utils: exit feature prep
 # -------------------------

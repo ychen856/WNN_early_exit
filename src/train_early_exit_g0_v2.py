@@ -11,14 +11,14 @@ import torch.nn.functional as F
 from src.core.linearExitHead import ExitHead
 from src.dataio.data import build_loaders_bits
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
-from src.exit.analyze_hidden import analyze_hidden_for_exit, compute_mu_sigma, select_keep_idx
+from src.exit.analyze_hidden import analyze_hidden_for_exit, compute_mu_sigma, select_exit_keep_idx
 from src.exit.ckpt_exit import ExitConfig
 from src.prune import *
 from src.early_exit import *
 from src.tools.utils import print_sweep_table
 from test import *
 from src.core.infer import *
-from src.core.multiLayerWNN import MultiLayerWNN, load_ckpt, save_ckpt
+from src.core.multiLayerWNN import MultiLayerWNN, load_ckpt, save_ckpt, save_ckpt_v2
 from torchvision import transforms
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -391,11 +391,6 @@ if __name__ == "__main__":
     )
 
     # backbone cfg 不動：從 ckpt 讀
-    #ckpt = load_ckpt(args.backbone_ckpt, device)
-    #backbone_cfg = ckpt["backbone_cfg"]
-    #model = MultiLayerWNN(**backbone_cfg).to(device)  # <-- 這行假設 backbone_cfg keys 跟 init 對得上
-    #model.load_state_dict(ckpt["model_state_dict"], strict=True)
-    # backbone cfg 不動：用舊 load_ckpt 來 init + load
     model, bb_cfg, ex_cfg, extra = load_ckpt(args.backbone_ckpt, device)
 
     # 這支 script 是「從 backbone 建 exit heads」，不應該吃到既有 exit cfg
@@ -404,6 +399,8 @@ if __name__ == "__main__":
 
     model = model.to(device)
     model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
 
     # 之後就用 bb_cfg 當 backbone_cfg（保存時原樣寫回）
     backbone_cfg = bb_cfg
@@ -412,31 +409,31 @@ if __name__ == "__main__":
     exit_layers = _parse_list(args.exit_layers, int)
     ks = _broadcast(_parse_list(args.k, int), len(exit_layers))
     keep_modes = _broadcast([x.strip() for x in args.keep_mode.split(",")], len(exit_layers))
-    taus = _broadcast([float(x.strip()) for x in args.exit_tau.split(",")], len(exit_layers))
+    exit_taus = _broadcast([float(x.strip()) for x in args.exit_tau.split(",")], len(exit_layers))
     thrs = _broadcast([float(x.strip()) for x in args.thr.split(",")], len(exit_layers))
 
     exit_heads = []
     exit_cfg_list = []
 
-    for layer_idx, k, kmode, tau, thr in zip(exit_layers, ks, keep_modes, taus, thrs):
+    for layer_idx, k, kmode, exit_tau, thr in zip(exit_layers, ks, keep_modes, exit_taus, thrs):
         print("\n" + "="*80)
-        print(f"Build/Train exit @ layer {layer_idx} | k={k} mode={kmode} tau={tau} thr={thr}")
+        print(f"Build/Train exit @ layer {layer_idx} | k={k} mode={kmode} exit_tau={exit_tau} thr={thr}")
         print("="*80)
 
         mean_d, std_d, p1_d, bias = analyze_hidden_for_exit(model, train_loader, device, layer_idx=layer_idx)
-        keep_idx = select_keep_idx(mean_d, std_d, p1_d, bias, k=k, keep_mode=kmode)
+        exit_keep_idx = select_exit_keep_idx(mean_d, std_d, p1_d, bias, k=k, keep_mode=kmode)
 
-        mu, sigma = compute_mu_sigma(model, train_loader, device, layer_idx=layer_idx, keep_idx=keep_idx)
+        mu, sigma = compute_mu_sigma(model, train_loader, device, layer_idx=layer_idx, exit_keep_idx=exit_keep_idx)
 
         # cache (optional normalization)
-        X_train, y_train = cache_exit_features(model, train_loader, device, layer_idx, keep_idx, mu, sigma, args.use_norm)
-        X_val, y_val     = cache_exit_features(model, val_loader,   device, layer_idx, keep_idx, mu, sigma, args.use_norm)
-        X_test, y_test   = cache_exit_features(model, test_loader,  device, layer_idx, keep_idx, mu, sigma, args.use_norm)
+        X_train, y_train = cache_exit_features(model, train_loader, device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
+        X_val, y_val     = cache_exit_features(model, val_loader,   device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
+        X_test, y_test   = cache_exit_features(model, test_loader,  device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
         print(f"[cache] train {tuple(X_train.shape)} val {tuple(X_val.shape)} test {tuple(X_test.shape)}")
 
         # head from scratch (but classifier trained on cached X)
-        head = ExitHead(k=k, num_classes=C, exit_tau=tau,
-                        keep_idx=keep_idx, mu=mu, sigma=sigma,
+        head = ExitHead(k=k, num_classes=C, exit_tau=exit_tau,
+                        exit_keep_idx=exit_keep_idx, mu=mu, sigma=sigma,
                         use_norm=args.use_norm)
 
         # 只訓練 classifier.weight（因為 keep_idx/mu/sigma 是 buffer）
@@ -451,11 +448,12 @@ if __name__ == "__main__":
             k=k,
             keep_mode=kmode,
             thr=thr,
-            exit_tau=tau,
-            keep_idx=keep_idx.cpu(),
+            exit_tau=exit_tau,
+            exit_keep_idx=exit_keep_idx.cpu(),
             mu=mu.cpu(),
             sigma=sigma.cpu(),
         ))
+
         exit_heads.append(head.cpu())
 
         # quick test acc of this exit alone
@@ -464,8 +462,12 @@ if __name__ == "__main__":
             acc = (logits.argmax(-1) == y_test).float().mean().item()
         print(f"[exit@layer{layer_idx}] test_exit_acc={acc*100:.2f}% | best_val={best_val*100:.2f}%")
 
-    '''# 最後存成一個 ckpt：backbone_cfg 不動 + backbone weights + exit_cfg_list
-    payload_exit_cfg = []
+    
+
+    # 最後存成一個 ckpt：backbone_cfg 不動 + backbone weights + exit_cfg_list
+    payload_exit_cfg = [ec.to_payload() for ec in exit_cfg_list]
+
+    '''payload_exit_cfg = []
     for ec in exit_cfg_list:
         payload_exit_cfg.append({
             "layer_idx": ec.layer_idx,
@@ -473,19 +475,64 @@ if __name__ == "__main__":
             "keep_mode": ec.keep_mode,
             "thr": float(ec.thr),
             "exit_tau": float(ec.exit_tau),
-            "keep_idx": ec.keep_idx,
+            "exit_keep_idx": ec.exit_keep_idx,
             "mu": ec.mu,
             "sigma": ec.sigma,
-        })
+        })'''
 
-    save_ckpt(
+    save_ckpt_v2(
         args.path_out,
         model,                 # backbone model
         backbone_cfg,          # backbone cfg 不動
-        exit_config=payload_exit_cfg,  # <-- exit cfg list
+        exit_cfg_list=payload_exit_cfg,  # <-- exit cfg list
         extra={"dataset": args.dataset}
     )
 
     print("\nSaved:", args.path_out)
-    print("Exit cfg list length:", len(payload_exit_cfg))'''
+    print("Exit cfg list length:", len(payload_exit_cfg))
+
+    thrs = [0.0, 0.5, 1.0, 2.0, 4.0]
+    for thr in thrs:
+        out = eval_overall_at_thr_multi_exit(
+            model, test_loader, device,
+            thr=thr,
+            exit_id=0,
+            exit_cfg_list=payload_exit_cfg,   # <-- 用 ExitConfig list
+            exit_heads=exit_heads,
+            use_prob_margin=False,
+        )
+        print(thr, out["exit_rate"], out["overall_acc"], out["exited_acc"], out["non_exited_acc"],
+              out["margin_mean"], out["margin_p95"])
+    
+    print('=======================================')
+    thrs0 = [0.5, 1.0, 1.5]
+    thrs1 = [1.5, 2.0, 2.5]
+
+    for thr0 in thrs0:
+        for thr1 in thrs1:
+            out = eval_cascade_multi_exit(
+                    model, test_loader, device,
+                    exit_heads=exit_heads,
+                    exit_cfg_list=payload_exit_cfg,
+                    thrs=[thr0, thr1],
+                    use_prob_margin=False,
+                )
+            s = sum(out["exit_rates"]) + out["final_rate"]
+            assert abs(s - 1.0) < 1e-6, s
+            '''print(thr0, thr1,
+                out["overall_acc"], out["exit_rates"], out["final_rate"],
+                out["exit_accs"],
+                out["final_acc"])'''
+
+            r0, r1 = out["exit_rates"]
+            rF = out["final_rate"]
+
+            exp_layers = 1*r0 + 2*r1 + 3*rF
+            compute_ratio = exp_layers / 3.0
+
+            print(thr0, thr1,
+                out["overall_acc"],
+                out["exit_rates"], out["final_rate"],
+                "E_layers", round(exp_layers, 4),
+                "compute", round(compute_ratio, 4))
 

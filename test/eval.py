@@ -12,6 +12,7 @@ from os.path import join
 from src.dataio.encode import encode_batch_thermo_plus_sobel
 
 from datasets.LoadDatasets import MnistDataloader
+from src.early_exit import _compute_margin_from_logits
 from src.tools.utils import _addr_from_bits
 
 
@@ -92,12 +93,33 @@ def eval_epoch(model, data_loader, device):
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    all_margins = []
+    wrong_margin_sum = 0.0
+    wrong_cnt = 0
+    correct_margin_sum = 0.0
+    correct_cnt = 0
 
     for xb, yb in data_loader:
         xb = xb.to(device)
         yb = yb.to(device)
 
         logits = model(xb)  
+
+        ''' # --- margin + exit decision ---
+        margin = _compute_margin_from_logits(logits, use_prob=False)
+        all_margins.append(margin.detach().cpu())
+
+        preds = logits.argmax(dim=1)
+        correct = (preds == yb)
+
+        # margin already computed: [B]
+        wrong_margin_sum += margin[~correct].sum().item()
+        wrong_cnt += (~correct).sum().item()
+        correct_margin_sum += margin[correct].sum().item()
+        correct_cnt += correct.sum().item()
+        #-------------------------------'''
+        
+
         loss = F.cross_entropy(logits, yb)
 
         preds = logits.argmax(dim=1)
@@ -107,6 +129,15 @@ def eval_epoch(model, data_loader, device):
 
     avg_loss = total_loss / total_samples
     acc = total_correct / total_samples
+
+    '''margins = torch.cat(all_margins, dim=0) if len(all_margins) else torch.tensor([])
+    margin_mean = float(margins.mean().item()) if margins.numel() else float("nan")
+    margin_p95 = float(torch.quantile(margins, 0.95).item()) if margins.numel() else float("nan")
+
+    print(f'margin mean: {margin_mean:.4f}, margin p95: {margin_p95:.4f}')
+    print(f'avg_loss: {avg_loss:.4f}, acc: {acc:.4f}')
+    print(f'correct_margin_sum: {correct_margin_sum:.4f}, correct_cnt: {correct_cnt}, wrong_margin_sum: {wrong_margin_sum:.4f}, wrong_cnt: {wrong_cnt}')
+'''
     return avg_loss, acc
 
 
