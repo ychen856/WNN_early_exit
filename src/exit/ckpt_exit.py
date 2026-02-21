@@ -31,6 +31,7 @@ class ExitConfig:
     exit_keep_idx: torch.Tensor  # [k] long cpu
     mu: torch.Tensor             # [k] float cpu
     sigma: torch.Tensor          # [k] float cpu
+    use_norm: bool = True
 
 
     def to_payload(self) -> Dict[str, Any]:
@@ -44,6 +45,7 @@ class ExitConfig:
             "exit_keep_idx": self.exit_keep_idx.cpu(),
             "mu": self.mu.cpu(),
             "sigma": self.sigma.cpu(),
+            "use_norm": bool(self.use_norm),
         }
 
     @staticmethod
@@ -58,6 +60,7 @@ class ExitConfig:
             exit_keep_idx=d["exit_keep_idx"].cpu(),
             mu=d["mu"].cpu(),
             sigma=d["sigma"].cpu(),
+            use_norm=bool(d.get("use_norm", True)),
         )
 
 
@@ -91,3 +94,6 @@ def normalize_exit_cfg_list(exit_cfg_list: Optional[List[ExitCfgLike]]) -> List[
         else:
             raise TypeError(f"Unknown exit cfg type: {type(item)}")
     return out
+
+
+

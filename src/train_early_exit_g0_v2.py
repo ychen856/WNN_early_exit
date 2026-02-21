@@ -452,6 +452,7 @@ if __name__ == "__main__":
             exit_keep_idx=exit_keep_idx.cpu(),
             mu=mu.cpu(),
             sigma=sigma.cpu(),
+            use_norm=args.use_norm,
         ))
 
         exit_heads.append(head.cpu())
@@ -467,22 +468,11 @@ if __name__ == "__main__":
     # 最後存成一個 ckpt：backbone_cfg 不動 + backbone weights + exit_cfg_list
     payload_exit_cfg = [ec.to_payload() for ec in exit_cfg_list]
 
-    '''payload_exit_cfg = []
-    for ec in exit_cfg_list:
-        payload_exit_cfg.append({
-            "layer_idx": ec.layer_idx,
-            "k": ec.k,
-            "keep_mode": ec.keep_mode,
-            "thr": float(ec.thr),
-            "exit_tau": float(ec.exit_tau),
-            "exit_keep_idx": ec.exit_keep_idx,
-            "mu": ec.mu,
-            "sigma": ec.sigma,
-        })'''
 
     save_ckpt_v2(
         args.path_out,
         model,                 # backbone model
+        exit_heads,
         backbone_cfg,          # backbone cfg 不動
         exit_cfg_list=payload_exit_cfg,  # <-- exit cfg list
         extra={"dataset": args.dataset}

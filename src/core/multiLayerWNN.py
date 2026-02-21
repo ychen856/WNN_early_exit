@@ -1,4 +1,4 @@
-from pyexpat import model
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -97,6 +97,7 @@ class MultiLayerWNN(nn.Module):
             return logits, h
         else:
             return logits
+
 
     def forward_with_all_hidden(self, x_bits: torch.Tensor):
         """
@@ -382,7 +383,7 @@ def load_ckpt(path: str,
 
     return model, bb_cfg, ex_cfg, ckpt.get("extra", {})
 
-def load_ckpt_v2(path, device):
+'''def load_ckpt_v2(path, device):
     ckpt = torch.load(path, map_location=device)
     backbone_cfg = ckpt["backbone_cfg"]
     payload_exit_cfg = ckpt.get("exit_cfg", [])
@@ -393,15 +394,70 @@ def load_ckpt_v2(path, device):
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
 
     extra = ckpt.get("extra", {})
-    return model, backbone_cfg, exit_cfg_list, extra
+    return model, backbone_cfg, exit_cfg_list, extra'''
 
 
-def save_ckpt_v2(path, model, backbone_cfg, exit_cfg_list=None, extra=None):
+import torch
+from typing import Any, Dict, Optional, Tuple, List
+
+def load_ckpt_v2(
+    path: str,
+    device,
+    build_model_fn,              # build_model_from_configs or your wrapper
+    build_exit_heads_fn,         # build_exit_heads_from_cfg (below)
+    load_exits: bool = True,
+):
+    """
+    Returns:
+      model, backbone_cfg, exit_cfg_list(payload), exit_heads, extra
+    """
+    ckpt = torch.load(path, map_location=device)
+
+    # ---- configs ----
+    backbone_cfg = ckpt["backbone_cfg"]
+    exit_cfg_payload = ckpt.get("exit_cfg", None)  # list of payload dicts
+    extra = ckpt.get("extra", {})
+
+    # ---- build backbone-only model ----
+    # 這裡最重要：不要把 exit_cfg 丟進 build_model（避免 model 裡 already built exits）
+    model = build_model_fn(backbone_cfg, ex_cfg=None, device=device).to(device)
+
+    # ---- load backbone weights ----
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    print("[load_ckpt_v2] backbone missing:", missing)
+    print("[load_ckpt_v2] backbone unexpected:", unexpected)
+
+    # ---- optionally load exits ----
+    exit_heads = None
+    if load_exits and exit_cfg_payload is not None:
+        # 1) payload -> cfg objects (if you want)
+        exit_cfg_list = exit_cfg_payload  # 先用 payload 也行（下面 head builder 支援 dict）
+        # 2) build heads
+        C = backbone_cfg["num_classes"] if "num_classes" in backbone_cfg else backbone_cfg["dataset_meta"]["num_classes"]
+        exit_heads = build_exit_heads_fn(exit_cfg_list, num_classes=C, device=device)
+        # 3) load head states
+        exits_sd: List[Dict[str, torch.Tensor]] = ckpt["exits_state_dict"]
+        assert len(exits_sd) == len(exit_heads), "exits_state_dict length mismatch"
+        for h, sd in zip(exit_heads, exits_sd):
+            h.load_state_dict(sd, strict=True)
+
+        return model, backbone_cfg, exit_cfg_payload, exit_heads, extra
+
+    return model, backbone_cfg, exit_cfg_payload, None, extra
+
+
+
+
+def save_ckpt_v2(path, model, exit_heads, backbone_cfg, exit_cfg_list=None, extra=None):
     exit_cfg_list = normalize_exit_cfg_list(exit_cfg_list)
     payload_exit_cfg = [ec.to_payload() for ec in exit_cfg_list]
+    exit_dict = []
+    for exit in exit_heads:
+        exit_dict.append(exit.state_dict())
 
     ckpt = {
         "model_state_dict": model.state_dict(),
+        "exits_state_dict": exit_dict,
         "backbone_cfg": backbone_cfg,
         "exit_cfg": payload_exit_cfg,   # <-- 永遠是 payload list
         "extra": extra or {},
@@ -445,3 +501,41 @@ def save_best_checkpoint_atomic(
 
     # atomic replace (best effort cross-platform)
     os.replace(tmp_path, path_out)
+
+
+# src/ckpt/loaders.py
+from typing import Any, Dict, Tuple, Optional
+import torch
+
+def build_backbone_only(backbone_cfg: dict, device):
+    cfg = dict(backbone_cfg)
+
+    # 常見非建模欄位先移除（保險）
+    cfg.pop("arch", None)
+
+    # ✅ 只保留 MultiLayerWNN.__init__ 真的接受的參數
+    sig = inspect.signature(MultiLayerWNN.__init__)
+    allowed = set(sig.parameters.keys()) - {"self"}
+    cfg = {k: v for k, v in cfg.items() if k in allowed}
+
+    model = MultiLayerWNN(**cfg).to(device)
+    return model
+
+def build_backbone_from_ckpt(path: str, device) -> Tuple[torch.nn.Module, Dict[str, Any], Dict[str, Any]]:
+    """
+    Reads ckpt saved by save_ckpt_v2 and returns backbone only.
+    Return: model, backbone_cfg, extra
+    """
+    ckpt = torch.load(path, map_location=device)
+
+    if "backbone_cfg" not in ckpt or "model_state_dict" not in ckpt:
+        raise ValueError("ckpt missing backbone_cfg or model_state_dict")
+
+    bb_cfg = ckpt["backbone_cfg"]
+    model = build_backbone_only(bb_cfg, device)
+
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    print("[build_backbone_from_ckpt] missing:", missing)
+    print("[build_backbone_from_ckpt] unexpected:", unexpected)
+
+    return model, bb_cfg, ckpt.get("extra", {})

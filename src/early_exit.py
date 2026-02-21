@@ -144,7 +144,7 @@ def eval_overall_at_thr_multi_exit(
 import torch
 import torch.nn.functional as F
 
-@torch.no_grad()
+#@torch.no_grad()
 def _head_logits_from_hidden(head, h, device):
     """
     h: [B, D_layer] on device
@@ -202,6 +202,8 @@ def eval_cascade_multi_exit(
 
     # (optional) margin stats per exit
     margins_per_exit = [[] for _ in range(num_exits)] if log_margins else None
+    margins_undecided = [[] for _ in range(num_exits)] if log_margins else None
+    margins_taken     = [[] for _ in range(num_exits)] if log_margins else None  # optional
 
     for xb, yb in loader:
         xb = xb.to(device)
@@ -230,6 +232,8 @@ def eval_cascade_multi_exit(
             if log_margins:
                 # 你可以選擇只記 undecided 的 margin；這邊先記全部，方便 debug
                 margins_per_exit[i].append(m_i.detach().cpu())
+                if undecided.any():
+                    margins_undecided[i].append(m_i[undecided].detach().cpu())
 
             take_i = undecided & (m_i > float(thrs[i]))
             if take_i.any():
@@ -241,6 +245,11 @@ def eval_cascade_multi_exit(
                 c_exit[i] += (preds[take_i] == yb[take_i]).sum().item()
 
                 undecided = undecided & (~take_i)
+            
+            if log_margins and take_i.any():
+                # 真的在這一層 exit 的樣本 margin（taken subset）
+                margins_taken[i].append(m_i[take_i].detach().cpu())
+            
 
         # 剩下走 final
         if undecided.any():
@@ -273,6 +282,29 @@ def eval_cascade_multi_exit(
             margin_stats.append({
                 "mean": float(m.mean().item()),
                 "p95": float(torch.quantile(m, 0.95).item()),
+            })
+        #out["margin_stats"] = margin_stats
+
+        for i in range(num_exits):
+            # undecided-only
+            if len(margins_undecided[i]) == 0:
+                mu_u, p95_u = float("nan"), float("nan")
+            else:
+                m_u = torch.cat(margins_undecided[i], dim=0)
+                mu_u = float(m_u.mean().item())
+                p95_u = float(torch.quantile(m_u, 0.95).item())
+
+            # taken-only (optional)
+            if len(margins_taken[i]) == 0:
+                mu_t, p95_t = float("nan"), float("nan")
+            else:
+                m_t = torch.cat(margins_taken[i], dim=0)
+                mu_t = float(m_t.mean().item())
+                p95_t = float(torch.quantile(m_t, 0.95).item())
+
+            margin_stats.append({
+                "undecided_mean": mu_u, "undecided_p95": p95_u,
+                "taken_mean": mu_t,     "taken_p95": p95_t,
             })
         out["margin_stats"] = margin_stats
 
