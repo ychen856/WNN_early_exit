@@ -1205,4 +1205,31 @@ def eval_cached_exit_metrics(
         }
     return results
 
+import copy
+from typing import List, Dict, Any, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def set_requires_grad(module: nn.Module, flag: bool):
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+def _head_logits_from_hidden_trainable(head, h, device):
+    """
+    與你 eval 用的 _head_logits_from_hidden 類似，但這裡**不要** @torch.no_grad()
+    head: ExitHead (has exit_keep_idx, mu, sigma, classifier, exit_tau)
+    h: [B, D_layer]
+    return: logits [B, C]
+    """
+    x = h[:, head.exit_keep_idx.to(device)]
+    if getattr(head, "use_norm", False):
+        mu = head.mu.to(device)
+        sigma = head.sigma.to(device)
+        x = (x - mu) / sigma
+    return head.classifier(x) / head.exit_tau
+
 
