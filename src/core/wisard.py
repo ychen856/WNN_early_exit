@@ -259,3 +259,72 @@ class WiSARD:
 
 
 
+import torch
+
+def build_cifar10_layer0_mapping(
+    num_luts: int,
+    k: int,
+    z: int,
+    H: int = 32,
+    W: int = 32,
+    C: int = 3,
+    patch: int = 5,        # local window size (odd)
+    seed: int = 42,
+    device: str = "cpu",
+    per_conn_random_t: bool = True,
+):
+    """
+    Return:
+      conn_idx: [num_luts, k] long tensor, each entry in [0, D*z)
+    """
+    assert patch % 2 == 1
+    g = torch.Generator(device="cpu").manual_seed(seed)
+
+    D = H * W * C
+    half = patch // 2
+
+    # precompute pixel index table: (c,y,x) -> p
+    # p = c*(H*W) + y*W + x
+    # We'll sample anchors and neighbors in (c,y,x).
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    # sample anchors
+    anchor_c = torch.randint(0, C, (num_luts,), generator=g)
+    anchor_y = torch.randint(0, H, (num_luts,), generator=g)
+    anchor_x = torch.randint(0, W, (num_luts,), generator=g)
+
+    for i in range(num_luts):
+        coords = []
+        # 1) anchor always included
+        coords.append((int(anchor_c[i]), int(anchor_y[i]), int(anchor_x[i])))
+
+        # 2) sample k-1 neighbors in local patch (allow same channel or force same channel)
+        for _ in range(k - 1):
+            dy = int(torch.randint(-half, half + 1, (1,), generator=g))
+            dx = int(torch.randint(-half, half + 1, (1,), generator=g))
+            cy = int(anchor_y[i]) + dy
+            cx = int(anchor_x[i]) + dx
+            # clamp to image boundary
+            cy = max(0, min(H - 1, cy))
+            cx = max(0, min(W - 1, cx))
+            cc = int(anchor_c[i])  # channel-aware (same channel); you can randomize if you want
+            coords.append((cc, cy, cx))
+
+        # coords -> pixel indices
+        pix = []
+        for (cc, cy, cx) in coords:
+            p = cc * (H * W) + cy * W + cx  # [0..D-1]
+            pix.append(p)
+        pix = torch.tensor(pix, dtype=torch.long)
+
+        # pixel -> bit
+        if per_conn_random_t:
+            t = torch.randint(0, z, (k,), generator=g)
+        else:
+            t = torch.zeros((k,), dtype=torch.long)
+        bit = pix * z + t  # [0..D*z-1]
+
+        conn[i] = bit
+
+    conn = conn.to(device)
+    return conn

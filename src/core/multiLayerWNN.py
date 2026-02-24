@@ -59,6 +59,9 @@ class MultiLayerWNN(nn.Module):
                     dropout_p=drop_ps[i],
                 )
             )
+            if i == 0:
+                print("layer0 conn idx uses mapping?", layers[0].conn_idx[:5])
+                print("layer0 conn idx max:", layers[0].conn_idx.max().item(), "in_bits:", layers[0].in_bits)
 
             self.layer_in_bits.append(prev_bits)
             self.layer_out_luts.append(n_lut)

@@ -189,7 +189,6 @@ def compute_dt_thresholds(x_train, z=32, eps=1e-8, max_elems=2_000_000):
         x = x_train
 
     x = x.float().cpu()
-
     # 2) feature-wise's min/max, normalize should use the same set
     xmin = x.min(dim=0, keepdim=True)[0]
     xmax = x.max(dim=0, keepdim=True)[0]
@@ -213,6 +212,9 @@ def compute_dt_thresholds(x_train, z=32, eps=1e-8, max_elems=2_000_000):
     q = torch.linspace(0, 1, steps=z+2)[1:-1]  # [z]
     thresholds = torch.quantile(flat_sample, q)
 
+    print("x_flat D:", x.view(x.size(0), -1).shape[1])
+    print("thresholds shape:", thresholds.shape)
+    print(f'xmin: {xmin.min().item():.4f}, xmax: {xmax.max().item():.4f}, thresholds min: {thresholds.min().item():.4f}, max: {thresholds.max().item():.4f}')
     return thresholds, xmin, xmax
 
 def dt_thermometer_encode(x, thresholds, xmin, xmax, eps=1e-8):
@@ -229,6 +231,7 @@ def dt_thermometer_encode(x, thresholds, xmin, xmax, eps=1e-8):
     xmin_dev = xmin.to(device)
     xmax_dev = xmax.to(device)
     th_dev   = thresholds.to(device)
+    print(f'th_dev shape: {th_dev.shape}, dtype: {th_dev.dtype}')
 
     x = (x - xmin_dev) / (xmax_dev - xmin_dev + eps)  
     B, D = x.shape

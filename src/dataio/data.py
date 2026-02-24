@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Optional
-
 import torch
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchvision import datasets
@@ -37,6 +36,9 @@ class DatasetMeta:
     name: str
     z: int
     val_ratio: float
+    channels: int
+    height: int
+    width: int
 
 
 def _load_torchvision_grayscale_dataset(name: str, root: str):
@@ -71,6 +73,41 @@ def _load_torchvision_grayscale_dataset(name: str, root: str):
     return x_train, y_train, x_test, y_test
 
 
+def _load_torchvision_color_dataset(
+    dataset: str,
+    root: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, DatasetMeta]:
+    """
+    Return:
+      x_train_u8: [N, 3, H, W] uint8
+      y_train:    [N] int64
+      x_test_u8:  [N, 3, H, W] uint8
+      y_test:     [N] int64
+      meta
+    """
+    name = dataset.upper()
+    if name == "CIFAR10":
+        # Define the data augmentation pipeline for the training set
+        train_ds = datasets.CIFAR10(root=root, train=True, download=True, transform=None)
+        test_ds  = datasets.CIFAR10(root=root, train=False, download=True, transform=None)
+
+        # torchvision CIFAR10 stores data as numpy: [N, H, W, C] uint8
+        x_train = torch.from_numpy(train_ds.data)  # uint8, [N,H,W,C]
+        y_train = torch.tensor(train_ds.targets, dtype=torch.long)
+        x_test  = torch.from_numpy(test_ds.data)
+        y_test  = torch.tensor(test_ds.targets, dtype=torch.long)
+
+        # to [N, C, H, W]
+        x_train_u8 = x_train.permute(0, 3, 1, 2).contiguous()
+        x_test_u8  = x_test.permute(0, 3, 1, 2).contiguous()
+
+        return x_train_u8, y_train, x_test_u8, y_test
+
+    else:
+        raise ValueError(f"Unsupported color dataset: {dataset}")
+
+
+
 def build_loaders_bits(
     dataset: str,
     root: str,
@@ -90,7 +127,23 @@ def build_loaders_bits(
       in_bits, num_classes,
       meta (thresholds/xmin/xmax/z)
     """
-    x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_grayscale_dataset(dataset, root)
+    if dataset == "CIFAR10":
+        x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_color_dataset(dataset, root)
+        meta = DatasetMeta(name="CIFAR10", z=z, val_ratio=0.1, channels=3, height=32, width=32)
+        
+    else:
+        x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_grayscale_dataset(dataset, root)
+        meta = DatasetMeta(
+        name=dataset,
+        z=z,
+        val_ratio=val_ratio,
+        channels=1,
+        height=28,
+        width=28,
+    )
+    
+    print(f'type: {x_train_u8.dtype}, min: {x_train_u8.min()}, max: {x_train_u8.max()}, shape: {x_train_u8.shape}')
+
 
     total_size = len(x_train_u8)
     val_size = int(val_ratio * total_size)
@@ -124,6 +177,12 @@ def build_loaders_bits(
     if device_for_encoding is None:
         device_for_encoding = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    x_bits = dt_thermometer_encode(x_train_u8.to(device_for_encoding), thresholds, xmin, xmax)  # [B, D*z] 或類似
+    print("x_bits:", x_bits.shape, x_bits.min().item(), x_bits.max().item())
+    print("ones rate:", (x_bits > 0.5).float().mean().item())
+    print("std:", x_bits.float().std().item())
+
+    print(x_train_u8.shape)
     x_train_bits = dt_thermometer_encode(x_train_u8.to(device_for_encoding), thresholds, xmin, xmax)
     x_val_bits   = dt_thermometer_encode(x_val_u8.to(device_for_encoding),   thresholds, xmin, xmax)
     x_test_bits  = dt_thermometer_encode(x_test_u8.to(device_for_encoding),  thresholds, xmin, xmax)
@@ -152,10 +211,6 @@ def build_loaders_bits(
         shuffle=False,
         drop_last=False,
     )
-
-    meta = DatasetMeta(
-        name=dataset,
-        z=z,
-        val_ratio=val_ratio,
-    )
+    
+    
     return train_loader, val_loader, test_loader, in_bits, num_classes, meta

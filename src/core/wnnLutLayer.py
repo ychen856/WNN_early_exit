@@ -67,6 +67,8 @@ class WNNLUTLayer(nn.Module):
 
         # let prune / export / extract_real_mapping can have `layer.conn_idx`
         self.register_buffer("conn_idx", conn)
+        print("conn_idx min/max:", conn.min().item(), conn.max().item())
+        print("expected max ~", in_bits-1)
 
         # -----------------------------
         # 2) Initialize LUT table
@@ -81,8 +83,11 @@ class WNNLUTLayer(nn.Module):
 
         # Binarize input bits to 0/1
         if self.binarize_input:
-            x_bits = (x_bits > 0.5).float()
-
+            #x_bits = (x_bits > 0.5).float()
+            #thr = x_bits.mean(dim=0, keepdim=True)     # [1, D]
+            #bits = (x_bits > thr)
+            thr = x_bits.median(dim=0, keepdim=True).values
+            bits = (x_bits > thr)
         # Extract k bits for each LUT
         # conn_idx: [num_luts, k]
         # -> [B, num_luts, k]
