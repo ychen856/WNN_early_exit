@@ -49,9 +49,7 @@ class MultiLayerWNN(nn.Module):
         
         for i, n_lut in enumerate(hidden_luts):
             layer_mapping = mapping if i == 0 else None
-            binarize_input = True
-            #binarize_input = (i == 0)
-
+            binarize_input = True if i == 0 else False  # 只有第一層需要 binarize（因為輸入是 bitplane）；後面層的輸入已經是 0/1 LUT output，不需要再 binarize
             '''layers.append(
                 WNNLUTLayer(
                     in_bits=prev_bits,
@@ -79,7 +77,6 @@ class MultiLayerWNN(nn.Module):
             else:
                 conn_idx = None  # later layers use random conn_idx by default; you can also build custom ones like conn0 if you want
             
-            conn_idx = None
             layers.append(
                 WNNLUTLayer(
                     in_bits=prev_bits,
@@ -87,7 +84,7 @@ class MultiLayerWNN(nn.Module):
                     lut_input_size=lut_input_size,
                     conn_idx=conn_idx,          # ✅ only for layer0
                     mapping=None,
-                    binarize_input=binarize_input,    # ✅ bitplane already 0/1
+                    binarize_input=True,    # ✅ bitplane already 0/1
                     dropout_p=dropout_p,
                 )
             )
