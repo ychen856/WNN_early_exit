@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from copy import deepcopy
 from typing import List, Tuple, Optional, List
 
+from src.core.wisard import build_patch_local_conn_idx_bitmajor, build_patch_local_conn_idx_chw
 from src.core.wnnLutLayer import WNNLUTLayer
 from src.exit.ckpt_exit import normalize_exit_cfg_list
 from src.tools.utils import get_exit1_features, make_dropout_schedule
@@ -45,11 +46,13 @@ class MultiLayerWNN(nn.Module):
         # 每層 dropout schedule
         drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
 
+        
         for i, n_lut in enumerate(hidden_luts):
             layer_mapping = mapping if i == 0 else None
-            binarize_input = (i == 0)
+            binarize_input = True
+            #binarize_input = (i == 0)
 
-            layers.append(
+            '''layers.append(
                 WNNLUTLayer(
                     in_bits=prev_bits,
                     num_luts=n_lut,
@@ -58,7 +61,39 @@ class MultiLayerWNN(nn.Module):
                     binarize_input=binarize_input,
                     dropout_p=drop_ps[i],
                 )
+            )'''
+            # example for CIFAR10 RGB bitplane:
+            # in_bits = 3*32*32*8 = 24576
+            if i == 0:
+                conn0 = build_patch_local_conn_idx_bitmajor(
+                    num_luts=n_lut,
+                    lut_input_size=lut_input_size,
+                    H=32, W=32, C=3,
+                    bits_per_channel=8,
+                    patch=(4,4),
+                    global_frac=0.2,   # 我建議先 0.2，降低 dup
+                    seed=42,
+                    device="cpu",
+                )
+                conn_idx = conn0.to(torch.long).cpu()
+            else:
+                conn_idx = None  # later layers use random conn_idx by default; you can also build custom ones like conn0 if you want
+            
+            conn_idx = None
+            layers.append(
+                WNNLUTLayer(
+                    in_bits=prev_bits,
+                    num_luts=n_lut,
+                    lut_input_size=lut_input_size,
+                    conn_idx=conn_idx,          # ✅ only for layer0
+                    mapping=None,
+                    binarize_input=binarize_input,    # ✅ bitplane already 0/1
+                    dropout_p=dropout_p,
+                )
             )
+
+            # later layers keep random conn (conn_idx=None, mapping=None)
+
             if i == 0:
                 print("layer0 conn idx uses mapping?", layers[0].conn_idx[:5])
                 print("layer0 conn idx max:", layers[0].conn_idx.max().item(), "in_bits:", layers[0].in_bits)
@@ -86,8 +121,11 @@ class MultiLayerWNN(nn.Module):
 
     def forward(self, x_bits, return_hidden: bool = False):
         h = x_bits
+        #b = (self.layers[0].conn_idx.view(-1) % 8).cpu()
+        #print("bitplane hist:", torch.bincount(b, minlength=8).float() / b.numel())
         for layer in self.layers:
             h = layer(h)
+            #print(f"after layer {layer}: h shape {h.shape}, min {h.min().item()}, max {h.max().item()}, mean {h.mean().item()}, std {h.std().item()}")
         
         if self.keep_idx.numel() > 0:
             h_used = h[:, self.keep_idx]

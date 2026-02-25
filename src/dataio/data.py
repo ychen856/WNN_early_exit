@@ -10,10 +10,12 @@ import torchvision.transforms as T
 
 # TODO: 改成你專案裡這兩個函式的實際 import
 # from src.encode import compute_dt_thresholds, dt_thermometer_encode
-from src.dataio.encode import dt_thermometer_encode, compute_dt_thresholds
+from src.dataio.encode import bitplane_encode_u8_gray, bitplane_encode_u8_rgb, dt_thermometer_encode, compute_dt_thresholds
 
 
 import random, numpy as np, torch
+
+from src.tools.utils import debug_xbits_layout
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -59,6 +61,19 @@ def _load_torchvision_grayscale_dataset(name: str, root: str):
     elif name_up in ("KMNIST", "KUZUSHIJIMNIST", "KUZUSHIJI-MNIST"):
         ds_tr = datasets.KMNIST(root=root, train=True, download=True, transform=None)
         ds_te = datasets.KMNIST(root=root, train=False, download=True, transform=None)
+    elif name_up in ("CIFAR10_GRAY", "CIFAR10-GRAY", "CIFAR10GRAY"):
+        ds_tr = datasets.CIFAR10(root=root, train=True, download=True, transform=None)
+        ds_te = datasets.CIFAR10(root=root, train=False, download=True, transform=None)
+        # to grayscale Y = 0.299R + 0.587G + 0.114B
+        ds_tr.data = (0.299 * ds_tr.data[:, :, :, 0] + 0.587 * ds_tr.data[:, :, :, 1] + 0.114 * ds_tr.data[:, :, :, 2])
+        ds_te.data = (0.299 * ds_te.data[:, :, :, 0] + 0.587 * ds_te.data[:, :, :, 1] + 0.114 * ds_te.data[:, :, :, 2])
+        print(f'ds_tr.data shape after grayscale: {ds_tr.data.shape}, dtype: {ds_tr.data.dtype}')
+        x_train = torch.from_numpy(ds_tr.data, dtype=torch.uint8)  # uint8, [N,H,W,C]
+        y_train = torch.tensor(ds_tr.targets, dtype=torch.long)
+        x_test  = torch.from_numpy(ds_te.data, dtype=torch.uint8)
+        y_test  = torch.tensor(ds_te.targets, dtype=torch.long)
+        return x_train, y_train, x_test, y_test
+
     else:
         raise ValueError(f"Unsupported dataset: {name}. Supported: MNIST/FMNSIT/KMNIST")
 
@@ -127,10 +142,13 @@ def build_loaders_bits(
       in_bits, num_classes,
       meta (thresholds/xmin/xmax/z)
     """
+    print('dataset:', dataset)
     if dataset == "CIFAR10":
         x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_color_dataset(dataset, root)
         meta = DatasetMeta(name="CIFAR10", z=z, val_ratio=0.1, channels=3, height=32, width=32)
-        
+    elif dataset == "CIFAR10_GRAY":
+        x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_grayscale_dataset(dataset, root)
+        meta = DatasetMeta(name="CIFAR10_GRAY", z=z, val_ratio=0.1, channels=1, height=32, width=32)
     else:
         x_train_u8, y_train, x_test_u8, y_test = _load_torchvision_grayscale_dataset(dataset, root)
         meta = DatasetMeta(
@@ -177,16 +195,24 @@ def build_loaders_bits(
     if device_for_encoding is None:
         device_for_encoding = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    x_bits = dt_thermometer_encode(x_train_u8.to(device_for_encoding), thresholds, xmin, xmax)  # [B, D*z] 或類似
+    '''x_bits = dt_thermometer_encode(x_train_u8.to(device_for_encoding), thresholds, xmin, xmax)  # [B, D*z] 或類似
     print("x_bits:", x_bits.shape, x_bits.min().item(), x_bits.max().item())
     print("ones rate:", (x_bits > 0.5).float().mean().item())
-    print("std:", x_bits.float().std().item())
+    print("std:", x_bits.float().std().item())'''
 
     print(x_train_u8.shape)
     x_train_bits = dt_thermometer_encode(x_train_u8.to(device_for_encoding), thresholds, xmin, xmax)
     x_val_bits   = dt_thermometer_encode(x_val_u8.to(device_for_encoding),   thresholds, xmin, xmax)
     x_test_bits  = dt_thermometer_encode(x_test_u8.to(device_for_encoding),  thresholds, xmin, xmax)
-    
+    '''x_train_bits = bitplane_encode_u8_rgb(x_train_u8.to(device_for_encoding))
+    x_val_bits   = bitplane_encode_u8_rgb(x_val_u8.to(device_for_encoding))
+    x_test_bits  = bitplane_encode_u8_rgb(x_test_u8.to(device_for_encoding))'''
+    '''x_train_bits = bitplane_encode_u8_gray(x_train_u8.to(device_for_encoding))
+    x_val_bits   = bitplane_encode_u8_gray(x_val_u8.to(device_for_encoding))
+    x_test_bits  = bitplane_encode_u8_gray(x_test_u8.to(device_for_encoding))'''
+    '''debug_xbits_layout(x_train_bits, C=3, H=32, W=32, Z_or_B=32, mode="thermo_feature_major")
+    debug_xbits_layout(x_train_bits, C=3, H=32, W=32, Z_or_B=32, mode="thermo_threshold_major")
+    debug_xbits_layout(x_train_bits, C=3, H=32, W=32, Z_or_B=32, mode="bitplane")'''
 
     in_bits = x_train_bits.size(1)
     num_classes = 10

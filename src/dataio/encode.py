@@ -495,3 +495,63 @@ if __name__ == '__main__':
         })
         print('Thermometer Encoding Summary (Dummy 28x28)', df)
 
+
+
+
+
+#======================
+# CIRAR10-specific loading + encoding
+#======================
+
+import torch
+
+def bitplane_encode_u8_rgb(x_u8: torch.Tensor, bits: int = 8) -> torch.Tensor:
+    """
+    x_u8: uint8, shape [N, 3, 32, 32]
+    return: float32 bits in {0,1}, shape [N, 3*32*32*bits]
+    bit order: LSB->MSB
+    """
+    assert x_u8.dtype == torch.uint8
+    assert x_u8.dim() == 4 and x_u8.size(1) == 3
+
+    x = x_u8.to(torch.int32)  # [N,3,H,W]
+    shifts = torch.arange(bits, device=x.device, dtype=torch.int32)  # [bits]
+    # [N,3,H,W,1] >> [bits] -> broadcast -> [N,3,H,W,bits]
+    b = (x.unsqueeze(-1) >> shifts) & 1
+    b = b.to(torch.float32)
+    return b.reshape(x.size(0), -1)
+
+
+def bitplane_encode_u8_gray(x_u8: torch.Tensor, bits: int = 8) -> torch.Tensor:
+    """
+    x_u8: uint8, shape [N, 32, 32] or [N,1,32,32]
+    return: float32 bits in {0,1}, shape [N, 32*32*bits]
+    """
+    assert x_u8.dtype == torch.uint8
+    if x_u8.dim() == 4:
+        assert x_u8.size(1) == 1
+        x_u8 = x_u8[:, 0]  # [N,32,32]
+    assert x_u8.dim() == 3
+
+    x = x_u8.to(torch.int32)  # [N,H,W]
+    shifts = torch.arange(bits, device=x.device, dtype=torch.int32)  # [bits]
+    b = (x.unsqueeze(-1) >> shifts) & 1  # [N,H,W,bits]
+    b = b.to(torch.float32)
+    return b.reshape(x.size(0), -1)
+
+def bitplane_encode_u8_gray(x_u8: torch.Tensor, bits: int = 8) -> torch.Tensor:
+    """
+    x_u8: uint8, shape [N, 32, 32] or [N,1,32,32]
+    return: float32 bits in {0,1}, shape [N, 32*32*bits]
+    """
+    assert x_u8.dtype == torch.uint8
+    if x_u8.dim() == 4:
+        assert x_u8.size(1) == 1
+        x_u8 = x_u8[:, 0]  # [N,32,32]
+    assert x_u8.dim() == 3
+
+    x = x_u8.to(torch.int32)  # [N,H,W]
+    shifts = torch.arange(bits, device=x.device, dtype=torch.int32)  # [bits]
+    b = (x.unsqueeze(-1) >> shifts) & 1  # [N,H,W,bits]
+    b = b.to(torch.float32)
+    return b.reshape(x.size(0), -1)

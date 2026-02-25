@@ -14,6 +14,7 @@ from src.early_exit import eval_exit1_epoch, eval_final_acc, eval_overall_at_thr
 from src.prune import *
 from src.tools.fpga_tools.fpga_export_utils import export_lut_init_files
 from src.tools.lut_converage import lut_pattern_coverage
+from src.tools.utils import debug_conn_idx
 from test import *
 from src.core.infer import *
 from src.core.multiLayerWNN import MultiLayerWNN, save_best_checkpoint_atomic, save_ckpt
@@ -274,13 +275,14 @@ if __name__ == "__main__":
 
 
     lut_input_size = 4
-    hidden_luts = (3000, 2000)  # 可以先不動，等後續 pruned backbone 再調整
+    hidden_luts = (6000, 2000)  # 可以先不動，等後續 pruned backbone 再調整
 
     # CIFAR10: C=3, H=W=32
     first_layer_mapping = build_cifar10_layer0_mapping(
         num_luts=hidden_luts[0],
         k=lut_input_size,
         z=ds_meta.z,
+        C=ds_meta.channels,
         seed=42,
         device="cpu",
     )
@@ -291,10 +293,10 @@ if __name__ == "__main__":
         num_classes=C,
         lut_input_size=lut_input_size,
         hidden_luts=hidden_luts,
-        #tau=0.165,
-        tau=0.1,
-        #mapping=None,
-        mapping=first_layer_mapping,
+        tau=0.165,
+        #tau=0.5,
+        mapping=None,
+        #mapping=first_layer_mapping,
         dropout_p=args.dropout_p,  # ✅ 新增：給 MultiLayerWNN 再往下傳
         dataset_meta=dict(name=ds_meta.name, z=ds_meta.z)
     )
@@ -309,13 +311,16 @@ if __name__ == "__main__":
         tau=backbone_cfg['tau'],               # Table 15 x 1/0.165 (~= 0.165)
         mapping=backbone_cfg['mapping'],       # [first_layer_mapping, None]
     ).to(device)
+
+    debug_conn_idx(model.layers[0].conn_idx, model.layers[0].in_bits, name="layer0.conn_idx")
     
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     print("bb_cfg in_bits:", backbone_cfg["in_bits"])
     print("layer0 in_bits:", model.layers[0].in_bits)
     print("layer0 conn min/max:", model.layers[0].conn_idx.min().item(), model.layers[0].conn_idx.max().item())
     print("layer0 conn negative count:", (model.layers[0].conn_idx < 0).sum().item())
-
+    uniq = torch.unique(model.layers[0].conn_idx).numel()
+    print("coverage:", uniq / float(in_bits))
 
     model = train_model(model, train_loader, val_loader, device, num_epochs=60, base_lr=args.base_lr, weight_decay=args.weight_decay)
     

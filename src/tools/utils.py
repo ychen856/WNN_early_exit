@@ -243,3 +243,70 @@ def print_sweep_table(all_metrics):
     print()
 
 
+
+
+import torch
+
+@torch.no_grad()
+def debug_xbits_layout(x_bits: torch.Tensor, C: int, H: int, W: int, Z_or_B: int, *, mode: str):
+    """
+    mode:
+      - "thermo_feature_major": idx = ((c*H*W + p)*Z + t)
+      - "thermo_threshold_major": idx = (t*(C*H*W) + (c*H*W + p))
+      - "bitplane": idx = (((c*H*W + p)*8) + b)   (assume 8 bits)
+    """
+    assert x_bits.dim() == 2
+    B, D = x_bits.shape
+    print(f"[xbits] B={B} D={D} ones_rate={x_bits.float().mean().item():.4f}")
+
+    # sample a few pixels across channels
+    sample = [
+        (0, 0, 0),      # c,y,x
+        (1, 0, 0),
+        (2, 0, 0),
+        (0, 16, 16),
+        (1, 16, 16),
+        (2, 16, 16),
+        (0, 31, 31),
+        (1, 31, 31),
+        (2, 31, 31),
+    ]
+
+    def idx_of(c, y, x, t_or_b):
+        p = y * W + x
+        if mode == "thermo_feature_major":
+            return ((c * H * W + p) * Z_or_B + t_or_b)
+        elif mode == "thermo_threshold_major":
+            return (t_or_b * (C * H * W) + (c * H * W + p))
+        elif mode == "bitplane":
+            return ((c * H * W + p) * 8 + t_or_b)
+        else:
+            raise ValueError(mode)
+
+    # For each sampled pixel: print mean over batch for each level/bit
+    for (c, y, x) in sample:
+        vals = []
+        for k in range(Z_or_B):
+            idx = idx_of(c, y, x, k)
+            if idx >= D:
+                vals.append(float("nan"))
+            else:
+                vals.append(x_bits[:, idx].float().mean().item())
+        vals_str = " ".join([f"{v:.2f}" for v in vals[:min(8, len(vals))]])
+        print(f"[pixel c{c} y{y} x{x}] first levels/bits mean: {vals_str} ...")
+
+@torch.no_grad()
+def debug_conn_idx(conn_idx: torch.Tensor, in_bits: int, name="conn"):
+    assert conn_idx.dtype == torch.long
+    mn = int(conn_idx.min().item())
+    mx = int(conn_idx.max().item())
+    neg = int((conn_idx < 0).sum().item())
+    oob = int((conn_idx >= in_bits).sum().item())
+    print(f"[{name}] shape={tuple(conn_idx.shape)} min={mn} max={mx} in_bits={in_bits} neg={neg} oob={oob}")
+
+    # coverage: how much of [0..in_bits) is used
+    flat = conn_idx.view(-1)
+    uniq = flat.unique()
+    print(f"[{name}] unique={uniq.numel()} / total={flat.numel()} (dup_rate={(1-uniq.numel()/flat.numel()):.3f})")
+    # where does it concentrate
+    print(f"[{name}] uniq min/max = {int(uniq.min())}/{int(uniq.max())}")

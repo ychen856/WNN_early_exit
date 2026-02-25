@@ -258,6 +258,9 @@ class WiSARD:
 
 
 
+#=========================
+# Example usage with CIFAR10
+#=========================
 
 import torch
 
@@ -328,3 +331,155 @@ def build_cifar10_layer0_mapping(
 
     conn = conn.to(device)
     return conn
+
+
+
+
+
+import torch
+from typing import Tuple, Optional
+
+def build_patch_local_conn_idx_chw(
+    num_luts: int,
+    lut_input_size: int,
+    H: int = 32,
+    W: int = 32,
+    C: int = 3,
+    patch: Tuple[int, int] = (4, 4),
+    global_frac: float = 0.1,
+    seed: int = 42,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    Return conn_idx: [num_luts, lut_input_size] long
+    Indexing assumes CHW flatten: idx = c*H*W + y*W + x
+    global_frac: fraction of bits sampled globally (rest from local patch)
+    """
+    assert 0.0 <= global_frac < 1.0
+    ph, pw = patch
+    assert ph > 0 and pw > 0
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    in_bits = C * H * W
+    conn = torch.empty((num_luts, lut_input_size), dtype=torch.long)
+
+    # how many local vs global per LUT
+    k_global = int(round(lut_input_size * global_frac))
+    k_local = lut_input_size - k_global
+
+    # pre-sample anchors uniformly over spatial + channel
+    # choose anchor pixel index in [0, H*W) and channel in [0, C)
+    anchors_xy = torch.randint(0, H * W, (num_luts,), generator=g)
+    anchors_c = torch.randint(0, C, (num_luts,), generator=g)
+
+    for i in range(num_luts):
+        y0 = int(anchors_xy[i].item() // W)
+        x0 = int(anchors_xy[i].item() % W)
+        c0 = int(anchors_c[i].item())
+
+        # local patch bounds
+        y1 = max(0, y0 - ph // 2)
+        y2 = min(H, y1 + ph)
+        x1 = max(0, x0 - pw // 2)
+        x2 = min(W, x1 + pw)
+
+        # if hit boundary, shift back to keep size
+        if (y2 - y1) < ph:
+            y1 = max(0, H - ph)
+            y2 = H
+        if (x2 - x1) < pw:
+            x1 = max(0, W - pw)
+            x2 = W
+
+        # candidate local indices (same channel by default)
+        ys = torch.arange(y1, y2)
+        xs = torch.arange(x1, x2)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        local_idx = (c0 * H * W + yy * W + xx).reshape(-1)  # [ph*pw]
+
+        # sample local bits
+        if k_local > 0:
+            sel = torch.randint(0, local_idx.numel(), (k_local,), generator=g)
+            picked_local = local_idx[sel]
+        else:
+            picked_local = torch.empty((0,), dtype=torch.long)
+
+        # sample global bits
+        if k_global > 0:
+            picked_global = torch.randint(0, in_bits, (k_global,), generator=g, dtype=torch.long)
+        else:
+            picked_global = torch.empty((0,), dtype=torch.long)
+
+        picked = torch.cat([picked_local, picked_global], dim=0)
+        conn[i] = picked
+
+    return conn.to(device)
+
+
+import torch
+
+@torch.no_grad()
+def build_patch_local_conn_idx_bitmajor(
+    *,
+    num_luts: int,
+    lut_input_size: int,
+    H: int,
+    W: int,
+    C: int,
+    bits_per_channel: int = 8,     # CIFAR uint8 -> 8
+    patch=(4, 4),
+    global_frac: float = 0.1,
+    seed: int = 42,
+    device="cpu",
+):
+    """
+    x_bits layout (bit-major):
+      idx = b*(C*H*W) + c*(H*W) + (y*W + x)
+    returns conn_idx: [num_luts, lut_input_size] in [0, C*H*W*bits_per_channel)
+    """
+    ph, pw = patch
+    assert ph <= H and pw <= W
+    in_bits = C * H * W * bits_per_channel
+    HW = H * W
+    BCHW = C * HW
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+
+    # sample patch anchors for each lut
+    y0 = torch.randint(0, H - ph + 1, (num_luts,), generator=g)
+    x0 = torch.randint(0, W - pw + 1, (num_luts,), generator=g)
+
+    conn = torch.empty((num_luts, lut_input_size), dtype=torch.long)
+
+    for i in range(num_luts):
+        chosen = set()
+        for j in range(lut_input_size):
+            use_global = (torch.rand((), generator=g).item() < global_frac)
+
+            if use_global:
+                # fully random over in_bits
+                idx = int(torch.randint(0, in_bits, (1,), generator=g).item())
+            else:
+                # patch-local: choose (b,c,y,x) but y,x constrained in patch
+                b = int(torch.randint(0, bits_per_channel, (1,), generator=g).item())
+                c = int(torch.randint(0, C, (1,), generator=g).item())
+                yy = int(y0[i].item()) + int(torch.randint(0, ph, (1,), generator=g).item())
+                xx = int(x0[i].item()) + int(torch.randint(0, pw, (1,), generator=g).item())
+                p = yy * W + xx
+                idx = b * BCHW + c * HW + p
+
+            # ensure unique within this LUT
+            tries = 0
+            while idx in chosen:
+                tries += 1
+                if tries > 50:
+                    # fallback: global random
+                    idx = int(torch.randint(0, in_bits, (1,), generator=g).item())
+                    break
+                idx = int(torch.randint(0, in_bits, (1,), generator=g).item())
+            chosen.add(idx)
+            conn[i, j] = idx
+
+    return conn.to(device)
