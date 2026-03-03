@@ -483,3 +483,1334 @@ def build_patch_local_conn_idx_bitmajor(
             conn[i, j] = idx
 
     return conn.to(device)
+
+
+import torch
+from typing import Tuple, Optional
+
+def build_conn0_rgb_sobel(
+    *,
+    num_luts: int,
+    k: int,
+    rgb_in_bits: int,
+    sobel_in_bits: int,
+    sobel_frac: float = 0.25,     # fraction of k that must come from sobel
+    sobel_mode: str = "global",   # "global" or "patch"
+    sobel_hw: Tuple[int, int] = (32, 32),  # sobel image size (gray)
+    patch_hw: Tuple[int, int] = (8, 8),
+    seed: int = 42,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    x_bits = concat([rgb_bitplane_bits, sobel_bits])  -> length = rgb_in_bits + sobel_in_bits
+
+    Return conn_idx: [num_luts, k] long, each LUT:
+      - picks k_sobel bits from sobel block
+      - picks k_rgb   bits from rgb block
+    """
+    assert rgb_in_bits > 0 and sobel_in_bits > 0
+    assert 0.0 <= sobel_frac <= 1.0
+    assert sobel_mode in ("global", "patch")
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    k_sobel = int(round(k * sobel_frac))
+    k_sobel = max(1, k_sobel) if sobel_frac > 0 else 0
+    k_sobel = min(k, k_sobel)
+    k_rgb = k - k_sobel
+
+    # helpers
+    def rand_unique(low: int, high: int, n: int) -> torch.Tensor:
+        # sample with replacement then unique-enough; for k<=10 it's fine
+        if n == 0:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.randint(low=low, high=high, size=(n,), generator=g, dtype=torch.long)
+
+    # sobel candidate sampling
+    if sobel_mode == "global":
+        def sample_sobel_bits(n: int) -> torch.Tensor:
+            # sobel block indices in [rgb_in_bits, rgb_in_bits+sobel_in_bits)
+            return rand_unique(rgb_in_bits, rgb_in_bits + sobel_in_bits, n)
+    else:
+        H, W = sobel_hw
+        ph, pw = patch_hw
+        assert H * W == sobel_in_bits, f"sobel_in_bits should be H*W, got {sobel_in_bits} vs {H*W}"
+        assert ph <= H and pw <= W
+
+        def sample_sobel_bits(n: int) -> torch.Tensor:
+            if n == 0:
+                return torch.empty((0,), dtype=torch.long)
+            # choose a random patch location
+            y0 = int(torch.randint(0, H - ph + 1, (1,), generator=g).item())
+            x0 = int(torch.randint(0, W - pw + 1, (1,), generator=g).item())
+            # flatten indices inside patch
+            ys = torch.arange(y0, y0 + ph, dtype=torch.long)
+            xs = torch.arange(x0, x0 + pw, dtype=torch.long)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+            patch_ids = (grid_y * W + grid_x).reshape(-1)  # [ph*pw]
+            # choose n positions from patch
+            pick = torch.randint(0, patch_ids.numel(), (n,), generator=g, dtype=torch.long)
+            sobel_local = patch_ids[pick]  # [n] in [0, H*W)
+            return sobel_local + rgb_in_bits
+
+    # rgb sampling (global)
+    def sample_rgb_bits(n: int) -> torch.Tensor:
+        return rand_unique(0, rgb_in_bits, n)
+
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+    for i in range(num_luts):
+        a = sample_sobel_bits(k_sobel)
+        b = sample_rgb_bits(k_rgb)
+        idx = torch.cat([a, b], dim=0)
+        # shuffle within LUT
+        if k > 1:
+            perm = torch.randperm(k, generator=g)
+            idx = idx[perm]
+        conn[i] = idx
+
+    return conn.to(device)
+
+import torch
+
+def build_conn0_rgb_thermo_sobel(
+    num_luts: int,
+    k: int,
+    H: int = 32,
+    W: int = 32,
+    C: int = 3,
+    rgb_bits_per_channel: int = 8,
+    thermo_levels: int = 8,
+    patch=(4, 4),
+    frac_thermo: float = 0.33,   # k=9 -> 3 bits
+    frac_sobel: float = 0.22,    # k=9 -> 2 bits
+    seed: int = 42,
+    device="cpu",
+):
+    """
+    concat layout (your current):
+      [0 : rgb_in_bits)                  -> rgb bitplane
+      [rgb_in_bits : rgb_in_bits+8192)   -> gray thermo (pixel-major, 8 levels)
+      [rgb_in_bits+8192 : end)           -> gray sobel (1 bit per pixel)
+
+    Returns:
+      conn_idx: LongTensor [num_luts, k], values in [0, 33792)
+    """
+    ph, pw = patch
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    rgb_in_bits = C * H * W * rgb_bits_per_channel
+    thermo_in_bits = H * W * thermo_levels         # 8192
+    sobel_in_bits = H * W                          # 1024
+
+    offset_rgb = 0
+    offset_thermo = rgb_in_bits
+    offset_sobel = rgb_in_bits + thermo_in_bits
+    total_bits = rgb_in_bits + thermo_in_bits + sobel_in_bits
+
+    # decide how many bits from each block per LUT
+    k_sobel = int(round(k * frac_sobel))
+    k_thermo = int(round(k * frac_thermo))
+    k_rgb = k - k_thermo - k_sobel
+    if k_rgb < 1:
+        # keep at least 1 rgb bit
+        k_rgb = 1
+        # take from thermo first, then sobel
+        while k_thermo + k_sobel > k - 1:
+            if k_thermo > 0:
+                k_thermo -= 1
+            elif k_sobel > 0:
+                k_sobel -= 1
+            else:
+                break
+
+    def rgb_bit_index(c, y, x, b):
+        # pixel-major within channel, then bit
+        # idx = (((c*H + y)*W + x)*BPC + b)
+        return offset_rgb + (((c * H + y) * W + x) * rgb_bits_per_channel + b)
+
+    def thermo_bit_index(y, x, level):
+        # pixel-major then level
+        pix = y * W + x
+        return offset_thermo + pix * thermo_levels + level
+
+    def sobel_bit_index(y, x):
+        pix = y * W + x
+        return offset_sobel + pix
+
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        # anchor for rgb and gray (you can share anchor too; here share y,x)
+        y0 = int(torch.randint(0, H, (1,), generator=g).item())
+        x0 = int(torch.randint(0, W, (1,), generator=g).item())
+
+        # sample coords within patch around (y0,x0)
+        ys = torch.randint(max(0, y0 - ph // 2), min(H, y0 + (ph + 1) // 2), (k_rgb + k_thermo + k_sobel,), generator=g)
+        xs = torch.randint(max(0, x0 - pw // 2), min(W, x0 + (pw + 1) // 2), (k_rgb + k_thermo + k_sobel,), generator=g)
+
+        ptr = 0
+        # RGB bits
+        for _ in range(k_rgb):
+            y = int(ys[ptr].item()); x = int(xs[ptr].item()); ptr += 1
+            c = int(torch.randint(0, C, (1,), generator=g).item())
+            b = int(torch.randint(0, rgb_bits_per_channel, (1,), generator=g).item())
+            conn[i, _] = rgb_bit_index(c, y, x, b)
+
+        # THERMO bits
+        for j in range(k_thermo):
+            y = int(ys[ptr].item()); x = int(xs[ptr].item()); ptr += 1
+            lvl = int(torch.randint(0, thermo_levels, (1,), generator=g).item())
+            conn[i, k_rgb + j] = thermo_bit_index(y, x, lvl)
+
+        # SOBEL bits
+        for j in range(k_sobel):
+            y = int(ys[ptr].item()); x = int(xs[ptr].item()); ptr += 1
+            conn[i, k_rgb + k_thermo + j] = sobel_bit_index(y, x)
+
+    # sanity (optional)
+    assert conn.min().item() >= 0 and conn.max().item() < total_bits, (conn.min().item(), conn.max().item(), total_bits)
+
+    return conn.to(device)
+
+
+
+
+
+import torch
+
+
+def build_conn0_rgb_thermo_sobel_v2(
+    num_luts: int,
+    k: int,
+    H: int = 32,
+    W: int = 32,
+    C: int = 3,
+    rgb_bits_per_channel: int = 8,
+    thermo_levels: int = 8,
+    patch=(4, 4),
+
+    frac_thermo: float = 0.33,   # k=9 -> ~3
+    frac_sobel: float = 0.22,    # k=9 -> ~2
+    sobel_jitter_p: float = 0.25,      # 讓一部分 LUT: k_sobel + 1
+    sobel_global_frac: float = 0.5,    # sobel bits 裡有多少比例用 global 抽樣 (其餘用 patch-local)
+
+    seed: int = 42,
+    device="cpu",
+    ensure_unique_per_lut: bool = True,
+):
+    """
+    concat layout (your current):
+      [0 : rgb_in_bits)                    -> rgb bitplane
+      [rgb_in_bits : rgb_in_bits+H*W*L)    -> gray thermo (pixel-major, thermo_levels)
+      [rgb_in_bits+H*W*L : end)            -> gray sobel (1 bit per pixel)
+
+    Returns:
+      conn_idx: LongTensor [num_luts, k], values in [0, total_bits)
+    """
+    ph, pw = patch
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    rgb_in_bits   = C * H * W * rgb_bits_per_channel
+    thermo_in_bits = H * W * thermo_levels
+    sobel_in_bits  = H * W
+
+    offset_rgb   = 0
+    offset_thermo = rgb_in_bits
+    offset_sobel  = rgb_in_bits + thermo_in_bits
+    total_bits    = rgb_in_bits + thermo_in_bits + sobel_in_bits
+
+    # -------- helpers (indexing) --------
+    def rgb_bit_index(c, y, x, b):
+        return offset_rgb + (((c * H + y) * W + x) * rgb_bits_per_channel + b)
+
+    def thermo_bit_index(y, x, level):
+        pix = y * W + x
+        return offset_thermo + pix * thermo_levels + level
+
+    def sobel_bit_index(y, x):
+        pix = y * W + x
+        return offset_sobel + pix
+
+    # -------- decide per-LUT counts --------
+    k_sobel_base  = int(round(k * frac_sobel))
+    k_thermo_base = int(round(k * frac_thermo))
+    print('k_sobel_base:', k_sobel_base, 'k_thermo_base:', k_thermo_base)
+
+    # 保底：至少 1 個 rgb bit
+    def clamp_counts(k_sobel, k_thermo):
+        k_rgb = k - k_sobel - k_thermo
+        if k_rgb < 1:
+            k_rgb = 1
+            # 優先從 thermo 扣，再扣 sobel
+            while k_thermo + k_sobel > k - 1:
+                if k_thermo > 0:
+                    k_thermo -= 1
+                elif k_sobel > 0:
+                    k_sobel -= 1
+                else:
+                    break
+        return k_rgb, k_thermo, k_sobel
+
+    # -------- build conn --------
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        # jitter sobel count: some LUTs use +1 sobel bit
+        k_sobel = k_sobel_base
+        if sobel_jitter_p > 0:
+            if torch.rand((), generator=g).item() < sobel_jitter_p:
+                k_sobel = min(k_sobel_base + 1, k)  # cap
+
+        k_thermo = k_thermo_base
+        k_rgb, k_thermo, k_sobel = clamp_counts(k_sobel, k_thermo)
+
+        # anchor (shared)
+        y0 = int(torch.randint(0, H, (1,), generator=g).item())
+        x0 = int(torch.randint(0, W, (1,), generator=g).item())
+
+        # patch-local coordinate sampler
+        y_lo = max(0, y0 - ph // 2)
+        y_hi = min(H, y0 + (ph + 1) // 2)
+        x_lo = max(0, x0 - pw // 2)
+        x_hi = min(W, x0 + (pw + 1) // 2)
+
+        used = set()
+        pos = 0
+
+        # ---- RGB bits (patch-local) ----
+        for _ in range(k_rgb):
+            for _try in range(50):
+                y = int(torch.randint(y_lo, y_hi, (1,), generator=g).item())
+                x = int(torch.randint(x_lo, x_hi, (1,), generator=g).item())
+                c = int(torch.randint(0, C, (1,), generator=g).item())
+                b = int(torch.randint(0, rgb_bits_per_channel, (1,), generator=g).item())
+                idx = rgb_bit_index(c, y, x, b)
+                if (not ensure_unique_per_lut) or (idx not in used):
+                    used.add(idx)
+                    conn[i, pos] = idx
+                    pos += 1
+                    break
+            else:
+                # fallback (allow duplicate)
+                conn[i, pos] = idx
+                pos += 1
+
+        # ---- THERMO bits (patch-local) ----
+        for _ in range(k_thermo):
+            for _try in range(50):
+                y = int(torch.randint(y_lo, y_hi, (1,), generator=g).item())
+                x = int(torch.randint(x_lo, x_hi, (1,), generator=g).item())
+                lvl = int(torch.randint(0, thermo_levels, (1,), generator=g).item())
+                idx = thermo_bit_index(y, x, lvl)
+                if (not ensure_unique_per_lut) or (idx not in used):
+                    used.add(idx)
+                    conn[i, pos] = idx
+                    pos += 1
+                    break
+            else:
+                conn[i, pos] = idx
+                pos += 1
+
+        # ---- SOBEL bits (mix local/global) ----
+        for _ in range(k_sobel):
+            for _try in range(50):
+                if sobel_global_frac > 0 and torch.rand((), generator=g).item() < sobel_global_frac:
+                    # global
+                    y = int(torch.randint(0, H, (1,), generator=g).item())
+                    x = int(torch.randint(0, W, (1,), generator=g).item())
+                else:
+                    # local
+                    y = int(torch.randint(y_lo, y_hi, (1,), generator=g).item())
+                    x = int(torch.randint(x_lo, x_hi, (1,), generator=g).item())
+
+                idx = sobel_bit_index(y, x)
+                if (not ensure_unique_per_lut) or (idx not in used):
+                    used.add(idx)
+                    conn[i, pos] = idx
+                    pos += 1
+                    break
+            else:
+                conn[i, pos] = idx
+                pos += 1
+
+        assert pos == k, f"pos={pos} != k={k}"
+
+    # sanity
+    mn = conn.min().item()
+    mx = conn.max().item()
+    assert 0 <= mn and mx < total_bits, (mn, mx, total_bits)
+
+    return conn.to(device)
+
+
+
+
+
+
+import torch
+
+def build_conn0_mixed_blocks(
+    num_luts: int,
+    k: int,
+    D_rgb: int,
+    D_post: int,
+    D_sobel: int = 1024,
+    k_sobel: int = 2,          # ✅ 這就是你要調的「sobel 的 k」
+    k_rgb: int = None,         # 可不填，會自動補
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    return conn_idx: [num_luts, k] in [0, D_total)
+    layout: [rgb_bitplane | thermo | sobel]
+    """
+    assert 0 <= k_sobel <= k
+    g = torch.Generator().manual_seed(seed)
+
+    D_total = D_rgb + D_post
+    D_thermo = D_post - D_sobel
+    assert D_thermo >= 0
+
+    # ranges
+    rgb_lo, rgb_hi = 0, D_rgb
+    thermo_lo, thermo_hi = D_rgb, D_rgb + D_thermo
+    sobel_lo, sobel_hi = D_rgb + D_thermo, D_total
+
+    if k_rgb is None:
+        # 先把剩下的給 rgb（你也可以改成 thermo 優先）
+        k_rgb = k - k_sobel
+    k_rgb = int(k_rgb)
+    k_thermo = k - k_rgb - k_sobel
+    assert k_thermo >= 0
+
+    # sample indices
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+    for i in range(num_luts):
+        cols = []
+        if k_rgb > 0:
+            cols.append(torch.randint(rgb_lo, rgb_hi, (k_rgb,), generator=g))
+        if k_thermo > 0 and D_thermo > 0:
+            cols.append(torch.randint(thermo_lo, thermo_hi, (k_thermo,), generator=g))
+        if k_sobel > 0:
+            cols.append(torch.randint(sobel_lo, sobel_hi, (k_sobel,), generator=g))
+
+        v = torch.cat(cols, dim=0)
+
+        # shuffle within LUT so bits aren't block-ordered
+        perm = torch.randperm(k, generator=g)
+        conn[i] = v[perm]
+
+    return conn
+
+
+
+
+
+import torch
+from collections import defaultdict
+
+def build_conn0_from_buckets(
+    *,
+    num_luts: int,
+    k: int,
+    total_bits: int,
+    bucketizer,                 # function: idx -> bucket_id (string)
+    frac_sobel: float = 0.22,
+    frac_thermo: float = 0.25,
+    seed: int = 42,
+    device: str = "cpu",
+    allow_dup_within_lut: bool = False,
+):
+    """
+    先把 [0,total_bits) 全部分桶: bucket -> list[bit_idx]
+    再依照 frac 配置，每個 LUT 抽 k_rgb/k_th/k_sb 個 idx。
+    """
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    # 1) bucket -> indices
+    buckets = defaultdict(list)
+    for idx in range(total_bits):
+        bid = bucketizer(idx)
+        buckets[bid].append(idx)
+
+    # 2) split bucket names into groups
+    rgb_buckets = [b for b in buckets.keys() if b.startswith("RGB_")]
+    th_buckets  = [b for b in buckets.keys() if b.startswith("TH_")]
+    sb_buckets  = [b for b in buckets.keys() if b.startswith("SB2_")]
+
+    assert len(rgb_buckets) > 0 and len(th_buckets) > 0 and len(sb_buckets) > 0
+
+    print(len(rgb_buckets), len(th_buckets), len(sb_buckets))
+    avg_size = np.mean([len(buckets[b]) for b in rgb_buckets])
+    print("avg rgb bucket size:", avg_size)
+    avg_size = np.mean([len(buckets[b]) for b in th_buckets])
+    print("avg th bucket size:", avg_size)
+    avg_size = np.mean([len(buckets[b]) for b in sb_buckets])
+    print("avg sb bucket size:", avg_size)
+
+    # 3) decide counts
+    k_sb = int(round(k * frac_sobel))
+    k_th = int(round(k * frac_thermo))
+    k_rgb = k - k_sb - k_th
+    if k_rgb < 1:
+        k_rgb = 1
+        while k_sb + k_th > k - 1:
+            if k_th > 0:
+                k_th -= 1
+            elif k_sb > 0:
+                k_sb -= 1
+            else:
+                break
+
+    # helper: sample one index from a random bucket in that group
+    def sample_from_group(group_buckets):
+        b = group_buckets[int(torch.randint(0, len(group_buckets), (1,), generator=g).item())]
+        lst = buckets[b]
+        return lst[int(torch.randint(0, len(lst), (1,), generator=g).item())]
+
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        chosen = []
+        for _ in range(k_rgb):
+            chosen.append(sample_from_group(rgb_buckets))
+        for _ in range(k_th):
+            chosen.append(sample_from_group(th_buckets))
+        for _ in range(k_sb):
+            chosen.append(sample_from_group(sb_buckets))
+
+        if not allow_dup_within_lut:
+            # de-dup within lut by resampling duplicates (cheap)
+            s = set()
+            for t in range(len(chosen)):
+                tries = 0
+                while chosen[t] in s and tries < 20:
+                    # re-sample from same group based on position
+                    if t < k_rgb:
+                        chosen[t] = sample_from_group(rgb_buckets)
+                    elif t < k_rgb + k_th:
+                        chosen[t] = sample_from_group(th_buckets)
+                    else:
+                        chosen[t] = sample_from_group(sb_buckets)
+                    tries += 1
+                s.add(chosen[t])
+
+        conn[i] = torch.tensor(chosen, dtype=torch.long)
+
+    # sanity
+    assert conn.min().item() >= 0 and conn.max().item() < total_bits
+    return conn.to(device)
+
+
+import torch, random
+from collections import defaultdict
+
+from collections import defaultdict
+import re
+import torch
+
+
+def build_conn0_from_buckets_2(
+    num_luts: int,
+    k: int,
+    total_bits: int,
+    bucketizer,  # callable(idx:int)->str  e.g. "RGB0_T00_b1", "TH_T77_H_l31", "SB2_T00_l0"
+    frac_sobel: float = 0.22,
+    frac_thermo: float = 0.25,
+    seed: int = 42,
+    device: str = "cpu",
+    *,
+    rgb_prefix: str = "RGB",      # "RGB" 或 "RGB_"
+    thermo_prefix: str = "TH_",   # 你目前用 "TH_"
+    sobel_prefix: str = "SB2_",   # 你目前用 "SB2_"
+    tile_regex: str = r"(T\d\d)", # 8x8 tiles -> T00..T77
+    enforce_all_blocks_per_lut: bool = True,  # True: 保證每個 LUT 至少 1 個 RGB/TH/SB bit（若 k 允許）
+):
+    """
+    Build conn_idx for layer0 using bucket sampling with per-LUT tile anchor.
+
+    Assumptions:
+      - bucketizer(idx) returns a bucket id string that includes a tile token like "T00".."T77"
+      - buckets are partitionable by prefix: RGB / TH_ / SB2_
+
+    Returns:
+      conn_idx: LongTensor [num_luts, k], values in [0, total_bits)
+    """
+    assert k >= 1
+    assert 0.0 <= frac_sobel <= 1.0
+    assert 0.0 <= frac_thermo <= 1.0
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    tile_pat = re.compile(tile_regex)
+
+    # -----------------------------
+    # 1) bucket -> indices
+    # -----------------------------
+    buckets = defaultdict(list)  # bid -> [idx...]
+    for idx in range(total_bits):
+        bid = bucketizer(int(idx))
+        buckets[bid].append(int(idx))
+
+    # -----------------------------
+    # 2) split bucket names into groups
+    # -----------------------------
+    rgb_bucket_names = [b for b in buckets.keys() if b.startswith(rgb_prefix)]
+    th_bucket_names  = [b for b in buckets.keys() if b.startswith(thermo_prefix)]
+    sb_bucket_names  = [b for b in buckets.keys() if b.startswith(sobel_prefix)]
+
+    if len(rgb_bucket_names) == 0 or len(th_bucket_names) == 0 or len(sb_bucket_names) == 0:
+        raise ValueError(
+            f"Empty bucket group(s): rgb={len(rgb_bucket_names)}, th={len(th_bucket_names)}, sb={len(sb_bucket_names)}. "
+            f"Check prefixes rgb_prefix={rgb_prefix} thermo_prefix={thermo_prefix} sobel_prefix={sobel_prefix}."
+        )
+
+    # group bucket names by tile
+    def group_by_tile(names):
+        out = defaultdict(list)  # tile -> [bucket_name...]
+        for b in names:
+            m = tile_pat.search(b)
+            if m is None:
+                continue
+            out[m.group(1)].append(b)
+        return out
+
+    rgb_by_tile = group_by_tile(rgb_bucket_names)
+    th_by_tile  = group_by_tile(th_bucket_names)
+    sb_by_tile  = group_by_tile(sb_bucket_names)
+
+    common_tiles = sorted(set(rgb_by_tile.keys()) & set(th_by_tile.keys()) & set(sb_by_tile.keys()))
+    if len(common_tiles) == 0:
+        raise ValueError(
+            f"No common tiles across blocks. "
+            f"rgb_tiles={len(rgb_by_tile)}, th_tiles={len(th_by_tile)}, sb_tiles={len(sb_by_tile)}. "
+            f"Check tile token in bucketizer (expected match {tile_regex})."
+        )
+
+    # -----------------------------
+    # 3) decide k splits
+    # -----------------------------
+    k_sb = int(round(k * frac_sobel))
+    k_th = int(round(k * frac_thermo))
+    k_rgb = k - k_th - k_sb
+
+    if enforce_all_blocks_per_lut and k >= 3:
+        # make sure each block has >=1
+        if k_rgb < 1:
+            k_rgb = 1
+        if k_th < 1:
+            k_th = 1
+        if k_sb < 1:
+            k_sb = 1
+        # adjust down if overflow
+        while k_rgb + k_th + k_sb > k:
+            # reduce the largest one (prefer reducing thermo then sobel then rgb)
+            if k_th >= k_sb and k_th >= k_rgb and k_th > 1:
+                k_th -= 1
+            elif k_sb >= k_th and k_sb >= k_rgb and k_sb > 1:
+                k_sb -= 1
+            elif k_rgb > 1:
+                k_rgb -= 1
+            else:
+                break
+    else:
+        # if not enforcing, still ensure not negative
+        if k_rgb < 0:
+            # steal from th/sb
+            while k_rgb < 0 and k_th > 0:
+                k_th -= 1
+                k_rgb += 1
+            while k_rgb < 0 and k_sb > 0:
+                k_sb -= 1
+                k_rgb += 1
+            if k_rgb < 0:
+                k_rgb = 0
+
+    assert k_rgb + k_th + k_sb == k, (k_rgb, k_th, k_sb, k)
+
+    # -----------------------------
+    # 4) sampling helper (tile-conditioned)
+    # -----------------------------
+    def sample_from_tile(tile: str, block: str) -> int:
+        if block == "rgb":
+            bnames = rgb_by_tile[tile]
+        elif block == "th":
+            bnames = th_by_tile[tile]
+        elif block == "sb":
+            bnames = sb_by_tile[tile]
+        else:
+            raise ValueError(block)
+
+        # choose a bucket name within tile
+        b = bnames[int(torch.randint(0, len(bnames), (1,), generator=g).item())]
+        lst = buckets[b]
+        # choose an index within that bucket
+        return int(lst[int(torch.randint(0, len(lst), (1,), generator=g).item())])
+
+    # -----------------------------
+    # 5) build conn
+    # -----------------------------
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        tile = common_tiles[int(torch.randint(0, len(common_tiles), (1,), generator=g).item())]
+
+        ptr = 0
+        for _ in range(k_rgb):
+            conn[i, ptr] = sample_from_tile(tile, "rgb")
+            ptr += 1
+        for _ in range(k_th):
+            conn[i, ptr] = sample_from_tile(tile, "th")
+            ptr += 1
+        for _ in range(k_sb):
+            conn[i, ptr] = sample_from_tile(tile, "sb")
+            ptr += 1
+
+        # optional: shuffle within LUT so blocks not grouped
+        perm = torch.randperm(k, generator=g)
+        conn[i] = conn[i, perm]
+
+    # final sanity
+    mn = int(conn.min().item())
+    mx = int(conn.max().item())
+    if mn < 0 or mx >= total_bits:
+        raise RuntimeError(f"conn out of range: min={mn}, max={mx}, total_bits={total_bits}")
+
+    return conn.to(device)
+
+
+
+from collections import defaultdict
+import re
+import torch
+
+
+def build_conn0_from_buckets_3(
+    num_luts: int,
+    k: int,
+    total_bits: int,
+    bucketizer,
+    *,
+    frac_sobel: float = 0.22,
+    frac_thermo: float = 0.25,
+    seed: int = 42,
+    device: str = "cpu",
+    # optional global fallback (default off, since you said it hurts)
+    global_frac_rgb: float = 0.0,
+    global_frac_th: float = 0.0,
+    global_frac_sb: float = 0.0,
+):
+    """
+    Build conn_idx [num_luts, k] from bucketizer(idx)->bucket_id.
+
+    Key behavior:
+      - For each LUT i:
+          1) sample a tile anchor (tx,ty)
+          2) sample k_rgb from RGB buckets in that tile
+             sample k_th  from TH  buckets in that tile
+             sample k_sb  from SB2 buckets in that tile
+      - This enforces "shared receptive field" across RGB/TH/SB2 inside each LUT.
+
+    bucketizer must return strings with prefixes: "RGB_", "TH_", "SB2_"
+    and include "T{tx}{ty}" inside the string (e.g. RGB_C0_T12_b1).
+    """
+
+    # -------------------------
+    # 1) Build buckets: bucket_id -> [indices]
+    # -------------------------
+    buckets = defaultdict(list)
+    for idx in range(total_bits):
+        bid = bucketizer(idx)
+        buckets[bid].append(idx)
+
+    rgb_bucket_names = [b for b in buckets.keys() if b.startswith("RGB_")]
+    th_bucket_names  = [b for b in buckets.keys() if b.startswith("TH_")]
+    sb_bucket_names  = [b for b in buckets.keys() if b.startswith("SB2_")]
+
+    assert len(rgb_bucket_names) > 0, "No RGB_ buckets found. Check bucketizer prefix."
+    assert len(th_bucket_names)  > 0, "No TH_ buckets found. Check bucketizer prefix."
+    assert len(sb_bucket_names)  > 0, "No SB2_ buckets found. Check bucketizer prefix."
+
+    # -------------------------
+    # 2) Group bucket names by tile (tx,ty)
+    # -------------------------
+    # Expect "..._T{tx}{ty}..." where tx,ty are digits 0..7 for CIFAR-10 (patch=4 => 8x8 tiles)
+    tile_pat = re.compile(r"_T(\d)(\d)_")
+
+    def tile_of(bucket_name: str):
+        m = tile_pat.search(bucket_name)
+        if m is None:
+            return None
+        return (int(m.group(1)), int(m.group(2)))
+
+    rgb_by_tile = defaultdict(list)
+    th_by_tile  = defaultdict(list)
+    sb_by_tile  = defaultdict(list)
+
+    for b in rgb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            rgb_by_tile[t].append(b)
+    for b in th_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            th_by_tile[t].append(b)
+    for b in sb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            sb_by_tile[t].append(b)
+
+    # Tiles that have all three blocks available
+    valid_tiles = sorted(set(rgb_by_tile.keys()) & set(th_by_tile.keys()) & set(sb_by_tile.keys()))
+    assert len(valid_tiles) > 0, "No valid tiles with RGB/TH/SB2 simultaneously. Check bucket naming."
+
+    # -------------------------
+    # 3) Decide per-LUT counts from each block
+    # -------------------------
+    k_sb = int(round(k * frac_sobel))
+    k_th = int(round(k * frac_thermo))
+    k_rgb = k - k_th - k_sb
+
+    # keep at least 1 rgb bit
+    if k_rgb < 1:
+        k_rgb = 1
+        while (k_th + k_sb) > (k - 1):
+            if k_th > 0:
+                k_th -= 1
+            elif k_sb > 0:
+                k_sb -= 1
+            else:
+                break
+
+    # -------------------------
+    # 4) Sampling helpers
+    # -------------------------
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    def rand_choice(seq):
+        # seq is python list
+        j = int(torch.randint(0, len(seq), (1,), generator=g).item())
+        return seq[j]
+
+
+    def jitter_tile(t, rad):
+        print('jittering tile', t, 'with radius', rad)
+        tx, ty = t
+        tx2 = max(0, min(7, tx + int(torch.randint(-rad, rad+1, (1,), generator=g).item())))
+        ty2 = max(0, min(7, ty + int(torch.randint(-rad, rad+1, (1,), generator=g).item())))
+        return (tx2, ty2)
+
+    def sample_from_tile(block: str, tile):
+        """
+        block in {"rgb","th","sb"}
+        Sample one global idx from that tile's bucket lists.
+        With probability global_frac_*: fallback to global uniform among that block's indices.
+        """
+        if block == "rgb":
+            if global_frac_rgb > 0 and torch.rand((), generator=g).item() < global_frac_rgb:
+                # global fallback: pick any rgb bucket then any idx inside it
+                b = rand_choice(rgb_bucket_names)
+                return rand_choice(buckets[b])
+            b = rand_choice(rgb_by_tile[tile])
+            return rand_choice(buckets[b])
+
+        if block == "th":
+            if global_frac_th > 0 and torch.rand((), generator=g).item() < global_frac_th:
+                b = rand_choice(th_bucket_names)
+                return rand_choice(buckets[b])
+            b = rand_choice(th_by_tile[tile])
+            return rand_choice(buckets[b])
+
+        if block == "sb":
+            if global_frac_sb > 0 and torch.rand((), generator=g).item() < global_frac_sb:
+                b = rand_choice(sb_bucket_names)
+                return rand_choice(buckets[b])
+            b = rand_choice(sb_by_tile[tile])
+            return rand_choice(buckets[b])
+
+        raise ValueError(block)
+
+    # -------------------------
+    # 5) Build conn_idx
+    # -------------------------
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        tile = rand_choice(valid_tiles)  # shared tile anchor
+
+        # fill in order: RGB, TH, SB2
+        ptr = 0
+        for _ in range(k_rgb):
+            conn[i, ptr] = int(sample_from_tile("rgb", tile))
+            ptr += 1
+        for _ in range(k_th):
+            conn[i, ptr] = int(sample_from_tile("th", tile))
+            ptr += 1
+        for _ in range(k_sb):
+            conn[i, ptr] = int(sample_from_tile("sb", tile))
+            ptr += 1
+
+    # final sanity
+    assert int(conn.min().item()) >= 0 and int(conn.max().item()) < total_bits, (
+        int(conn.min().item()), int(conn.max().item()), total_bits
+    )
+
+    return conn.to(device)
+
+
+
+
+
+
+import re
+from collections import defaultdict
+import torch
+
+def build_conn0_from_buckets_4(
+    num_luts: int,
+    k: int,
+    total_bits: int,
+    bucketizer,
+    *,
+    frac_sobel: float = 0.22,
+    frac_thermo: float = 0.25,
+    seed: int = 42,
+    device: str = "cpu",
+
+    # optional global fallback (default off)
+    global_frac_rgb: float = 0.0,
+    global_frac_th: float = 0.0,
+    global_frac_sb: float = 0.0,
+
+    # ---- jitter controls (the thing you want) ----
+    p_rgb_same: float = 1.0,   # RGB 通常最 local
+    p_th_same: float = 0.7,    # TH: mostly same tile, some jitter
+    p_sb_same: float = 0.4,    # SB2: more jitter
+    rad_rgb: int = 0,
+    rad_th: int = 1,
+    rad_sb: int = 2,
+):
+    """
+    bucketizer(idx)->bucket_id must return prefixes: "RGB_", "TH_", "SB2_"
+    and bucket_id must include substring "_T{tx}{ty}_" (tx,ty are digits 0..7).
+
+    This builds conn_idx [num_luts, k] by:
+      - anchor a tile0 per LUT
+      - sample k_rgb/k_th/k_sb indices from buckets in (tile0 or jittered tile)
+      - fallback if jittered tile has no buckets for that block
+    """
+
+    # -------------------------
+    # 1) Build buckets: bucket_id -> [indices]
+    # -------------------------
+    buckets = defaultdict(list)
+    for idx in range(total_bits):
+        bid = bucketizer(idx)
+        buckets[bid].append(idx)
+
+    rgb_bucket_names = [b for b in buckets.keys() if b.startswith("RGB_")]
+    th_bucket_names  = [b for b in buckets.keys() if b.startswith("TH_")]
+    sb_bucket_names  = [b for b in buckets.keys() if b.startswith("SB2_")]
+
+    assert len(rgb_bucket_names) > 0, "No RGB_ buckets found. Check bucketizer prefix."
+    assert len(th_bucket_names)  > 0, "No TH_ buckets found. Check bucketizer prefix."
+    assert len(sb_bucket_names)  > 0, "No SB2_ buckets found. Check bucketizer prefix."
+
+    # -------------------------
+    # 2) Group bucket names by tile (tx,ty)
+    # -------------------------
+    tile_pat = re.compile(r"_T(\d)(\d)_")
+
+    def tile_of(bucket_name: str):
+        m = tile_pat.search(bucket_name)
+        if m is None:
+            return None
+        return (int(m.group(1)), int(m.group(2)))
+
+    rgb_by_tile = defaultdict(list)
+    th_by_tile  = defaultdict(list)
+    sb_by_tile  = defaultdict(list)
+
+    for b in rgb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            rgb_by_tile[t].append(b)
+    for b in th_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            th_by_tile[t].append(b)
+    for b in sb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            sb_by_tile[t].append(b)
+
+    # Tiles that have all three blocks available (for anchor choice)
+    valid_tiles = sorted(set(rgb_by_tile.keys()) & set(th_by_tile.keys()) & set(sb_by_tile.keys()))
+    assert len(valid_tiles) > 0, "No valid tiles with RGB/TH/SB2 simultaneously. Check bucket naming."
+
+    # -------------------------
+    # 3) Decide per-LUT counts from each block
+    # -------------------------
+    k_sb = int(round(k * frac_sobel))
+    k_th = int(round(k * frac_thermo))
+    k_rgb = k - k_th - k_sb
+
+    if k_rgb < 1:
+        k_rgb = 1
+        while (k_th + k_sb) > (k - 1):
+            if k_th > 0:
+                k_th -= 1
+            elif k_sb > 0:
+                k_sb -= 1
+            else:
+                break
+
+    # -------------------------
+    # 4) RNG helpers
+    # -------------------------
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    def rand_choice(lst):
+        return lst[int(torch.randint(0, len(lst), (1,), generator=g).item())]
+
+    def jitter_tile(t, rad):
+        if rad <= 0:
+            return t
+        tx, ty = t
+        tx2 = max(0, min(7, tx + int(torch.randint(-rad, rad + 1, (1,), generator=g).item())))
+        ty2 = max(0, min(7, ty + int(torch.randint(-rad, rad + 1, (1,), generator=g).item())))
+        return (tx2, ty2)
+
+    def choose_tile_for_block(block: str, tile0):
+        if block == "rgb":
+            p_same, rad, by_tile = p_rgb_same, rad_rgb, rgb_by_tile
+        elif block == "th":
+            p_same, rad, by_tile = p_th_same, rad_th, th_by_tile
+        elif block == "sb":
+            p_same, rad, by_tile = p_sb_same, rad_sb, sb_by_tile
+        else:
+            raise ValueError(block)
+
+        # pick tile candidate
+        tile = tile0 if torch.rand((), generator=g).item() < p_same else jitter_tile(tile0, rad)
+
+        # fallback if tile not available for that block
+        if tile not in by_tile or len(by_tile[tile]) == 0:
+            if tile0 in by_tile and len(by_tile[tile0]) > 0:
+                return tile0
+            # last resort: pick some tile that has that block
+            any_tiles = list(by_tile.keys())
+            return rand_choice(any_tiles)
+
+        return tile
+
+    def sample_from_tile(block: str, tile0):
+        # optional global fallback
+        if block == "rgb" and global_frac_rgb > 0 and torch.rand((), generator=g).item() < global_frac_rgb:
+            b = rand_choice(rgb_bucket_names)
+            return rand_choice(buckets[b])
+        if block == "th" and global_frac_th > 0 and torch.rand((), generator=g).item() < global_frac_th:
+            b = rand_choice(th_bucket_names)
+            return rand_choice(buckets[b])
+        if block == "sb" and global_frac_sb > 0 and torch.rand((), generator=g).item() < global_frac_sb:
+            b = rand_choice(sb_bucket_names)
+            return rand_choice(buckets[b])
+
+        tile = choose_tile_for_block(block, tile0)
+
+        if block == "rgb":
+            b = rand_choice(rgb_by_tile[tile])
+        elif block == "th":
+            b = rand_choice(th_by_tile[tile])
+        elif block == "sb":
+            b = rand_choice(sb_by_tile[tile])
+        else:
+            raise ValueError(block)
+
+        return rand_choice(buckets[b])
+
+    # -------------------------
+    # 5) Build conn_idx
+    # -------------------------
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        tile0 = rand_choice(valid_tiles)  # shared anchor for this LUT
+
+        ptr = 0
+        for _ in range(k_rgb):
+            conn[i, ptr] = int(sample_from_tile("rgb", tile0)); ptr += 1
+        for _ in range(k_th):
+            conn[i, ptr] = int(sample_from_tile("th", tile0)); ptr += 1
+        for _ in range(k_sb):
+            conn[i, ptr] = int(sample_from_tile("sb", tile0)); ptr += 1
+
+    assert int(conn.min().item()) >= 0 and int(conn.max().item()) < total_bits, (
+        int(conn.min().item()), int(conn.max().item()), total_bits
+    )
+
+    return conn.to(device)
+
+
+
+
+
+
+    import re
+import torch
+from collections import defaultdict
+from typing import Callable, Tuple, Dict, List
+
+def build_conn0_hybrid_from_buckets(
+    num_luts: int,
+    k: int,
+    total_bits: int,
+    bucketizer: Callable[[int], str],
+    *,
+    frac_sobel: float = 0.22,
+    frac_thermo: float = 0.25,
+    seed: int = 42,
+    device: str = "cpu",
+
+    # hybrid control: fraction of LUTs using bucket/tile structure
+    p_struct: float = 0.35,
+
+    # bucket sampling locality controls (only used when struct LUT is chosen)
+    p_rgb_same: float = 1.0,
+    p_th_same: float = 0.7,
+    p_sb_same: float = 0.4,
+    rad_rgb: int = 0,
+    rad_th: int = 1,
+    rad_sb: int = 2,
+
+    # IMPORTANT: de-duplicate indices inside each LUT to keep effective k
+    dedup_within_lut: bool = True,
+):
+    """
+    Hybrid conn builder:
+      - Build buckets from bucketizer(idx)->bucket_id, bucket_id includes "_T{tx}{ty}_".
+      - For each LUT:
+          with prob p_struct:
+              sample k_rgb/k_th/k_sb using tile-anchored bucket selection (+ optional jitter)
+          else:
+              sample k_rgb/k_th/k_sb uniformly from each block's indices (global within block)
+      - Optionally enforce no duplicate indices within each LUT (recommended).
+    """
+
+    # -------------------------
+    # 0) RNG
+    # -------------------------
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+
+    def randu():
+        return float(torch.rand((), generator=g).item())
+
+    def randint(a: int, b: int) -> int:
+        # inclusive a..b
+        return int(torch.randint(a, b + 1, (1,), generator=g).item())
+
+    def rand_choice(lst: List):
+        return lst[int(torch.randint(0, len(lst), (1,), generator=g).item())]
+
+    # -------------------------
+    # 1) buckets: bucket_id -> [indices]
+    # -------------------------
+    buckets: Dict[str, List[int]] = defaultdict(list)
+    for idx in range(total_bits):
+        bid = bucketizer(idx)
+        buckets[bid].append(idx)
+
+    rgb_bucket_names = [b for b in buckets.keys() if b.startswith("RGB_")]
+    th_bucket_names  = [b for b in buckets.keys() if b.startswith("TH_")]
+    sb_bucket_names  = [b for b in buckets.keys() if b.startswith("SB2_")]
+
+    assert len(rgb_bucket_names) > 0, "No RGB_ buckets found. Check bucketizer prefix."
+    assert len(th_bucket_names)  > 0, "No TH_ buckets found. Check bucketizer prefix."
+    assert len(sb_bucket_names)  > 0, "No SB2_ buckets found. Check bucketizer prefix."
+
+    # -------------------------
+    # 2) group buckets by tile
+    # -------------------------
+    tile_pat = re.compile(r"_T(\d)(\d)_")
+
+    def tile_of(bucket_name: str):
+        m = tile_pat.search(bucket_name)
+        if m is None:
+            return None
+        return (int(m.group(1)), int(m.group(2)))
+
+    rgb_by_tile = defaultdict(list)
+    th_by_tile  = defaultdict(list)
+    sb_by_tile  = defaultdict(list)
+
+    for b in rgb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            rgb_by_tile[t].append(b)
+    for b in th_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            th_by_tile[t].append(b)
+    for b in sb_bucket_names:
+        t = tile_of(b)
+        if t is not None:
+            sb_by_tile[t].append(b)
+
+    valid_tiles = sorted(set(rgb_by_tile.keys()) & set(th_by_tile.keys()) & set(sb_by_tile.keys()))
+    assert len(valid_tiles) > 0, "No valid tiles with RGB/TH/SB2 simultaneously. Check bucket naming."
+
+    # -------------------------
+    # 3) decide k per block
+    # -------------------------
+    k_sb = int(round(k * frac_sobel))
+    k_th = int(round(k * frac_thermo))
+    k_rgb = k - k_th - k_sb
+
+    # keep at least 1 rgb bit
+    if k_rgb < 1:
+        k_rgb = 1
+        while (k_th + k_sb) > (k - 1):
+            if k_th > 0:
+                k_th -= 1
+            elif k_sb > 0:
+                k_sb -= 1
+            else:
+                break
+
+    # -------------------------
+    # 4) infer block ranges (IMPORTANT)
+    # We infer D_rgb/D_th/D_sb by scanning a few sentinel points.
+    # But you already know total_bits = D_rgb + D_th + D_sb.
+    #
+    # The safest is to pass these explicitly, BUT since you didn't,
+    # we derive them from bucket prefixes:
+    #   - min idx in TH_ buckets gives offset_TH (=D_rgb)
+    #   - min idx in SB2_ buckets gives offset_SB (=D_rgb + D_th)
+    #   - then D_sb = total_bits - offset_SB
+    # -------------------------
+    min_th = min(min(buckets[b]) for b in th_bucket_names)
+    min_sb = min(min(buckets[b]) for b in sb_bucket_names)
+
+    D_rgb = min_th
+    D_th  = min_sb - min_th
+    D_sb  = total_bits - min_sb
+
+    # sanity (matches your printed: 6144/32768/2048/40960)
+    assert D_rgb > 0 and D_th > 0 and D_sb > 0, (D_rgb, D_th, D_sb, total_bits)
+
+    # -------------------------
+    # 5) helpers: jitter tile + sample from bucket list
+    # -------------------------
+    def jitter_tile(tile: Tuple[int, int], rad: int):
+        if rad <= 0:
+            return tile
+        tx, ty = tile
+        tx2 = max(0, min(7, tx + randint(-rad, rad)))
+        ty2 = max(0, min(7, ty + randint(-rad, rad)))
+        return (tx2, ty2)
+
+    def pick_bucket_in_tile(block: str, tile: Tuple[int, int], p_same: float, rad: int):
+        # choose tile: same with prob p_same else jittered
+        t2 = tile if randu() < p_same else jitter_tile(tile, rad)
+
+        if block == "rgb":
+            lst = rgb_by_tile[t2]
+        elif block == "th":
+            lst = th_by_tile[t2]
+        elif block == "sb":
+            lst = sb_by_tile[t2]
+        else:
+            raise ValueError(block)
+
+        return rand_choice(lst)
+
+    def sample_structured_one(block: str, tile: Tuple[int, int]) -> int:
+        if block == "rgb":
+            b = pick_bucket_in_tile("rgb", tile, p_rgb_same, rad_rgb)
+        elif block == "th":
+            b = pick_bucket_in_tile("th", tile, p_th_same, rad_th)
+        elif block == "sb":
+            b = pick_bucket_in_tile("sb", tile, p_sb_same, rad_sb)
+        else:
+            raise ValueError(block)
+        return int(rand_choice(buckets[b]))
+
+    def sample_unstructured_one(block: str) -> int:
+        # uniform inside each block's index range (fast and diverse)
+        if block == "rgb":
+            return int(torch.randint(0, D_rgb, (1,), generator=g).item())
+        if block == "th":
+            return D_rgb + int(torch.randint(0, D_th, (1,), generator=g).item())
+        if block == "sb":
+            return D_rgb + D_th + int(torch.randint(0, D_sb, (1,), generator=g).item())
+        raise ValueError(block)
+
+    # -------------------------
+    # 6) build conn
+    # -------------------------
+    conn = torch.empty((num_luts, k), dtype=torch.long)
+
+    for i in range(num_luts):
+        structured = (randu() < p_struct)
+        tile = rand_choice(valid_tiles)  # anchor tile (used only if structured)
+
+        chosen = []
+        def add_one(idx: int):
+            if not dedup_within_lut:
+                chosen.append(idx)
+                return
+            # dedup
+            if idx in chosen:
+                return
+            chosen.append(idx)
+
+        # fill target counts
+        targets = [("rgb", k_rgb), ("th", k_th), ("sb", k_sb)]
+        for block, cnt in targets:
+            tries = 0
+            while sum(1 for x in chosen if True) < k and cnt > 0:
+                if structured:
+                    idx = sample_structured_one(block, tile)
+                else:
+                    idx = sample_unstructured_one(block)
+
+                add_one(idx)
+                if len(chosen) >= (k - sum(c for _, c in targets if False)):
+                    # no-op, kept for readability
+                    pass
+
+                # decrement only when we successfully add (so counts stay correct under dedup)
+                if (not dedup_within_lut) or (idx in chosen):
+                    cnt -= 1
+
+                tries += 1
+                # avoid infinite loop under aggressive dedup
+                if tries > 50 * k:
+                    break
+
+        # if dedup caused shortfall, backfill globally (any block) until length k
+        tries = 0
+        while len(chosen) < k:
+            # backfill from any block, but prefer rgb to keep at least 1
+            block = "rgb" if randu() < 0.5 else ("th" if randu() < 0.5 else "sb")
+            idx = sample_unstructured_one(block)
+            add_one(idx)
+            tries += 1
+            if tries > 200 * k:
+                break
+
+        conn[i, :] = torch.tensor(chosen[:k], dtype=torch.long)
+
+    # final sanity
+    assert int(conn.min().item()) >= 0 and int(conn.max().item()) < total_bits, (
+        int(conn.min().item()), int(conn.max().item()), total_bits
+    )
+    return conn.to(device)

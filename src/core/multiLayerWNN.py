@@ -5,10 +5,11 @@ import torch.nn.functional as F
 from copy import deepcopy
 from typing import List, Tuple, Optional, List
 
-from src.core.wisard import build_patch_local_conn_idx_bitmajor, build_patch_local_conn_idx_chw
+from src.core.wisard import build_conn0_from_buckets, build_conn0_from_buckets_2, build_conn0_from_buckets_3, build_conn0_from_buckets_4, build_conn0_hybrid_from_buckets, build_conn0_rgb_thermo_sobel_v2
 from src.core.wnnLutLayer import WNNLUTLayer
+from src.dataio.encode import bucket_id_from_global_idx, bucket_id_from_global_idx_rgb_th_sobel2
 from src.exit.ckpt_exit import normalize_exit_cfg_list
-from src.tools.utils import get_exit1_features, make_dropout_schedule
+from src.tools.utils import get_exit1_features, make_dropout_schedule, summarize_conn0
 
 
 class MultiLayerWNN(nn.Module):
@@ -17,6 +18,7 @@ class MultiLayerWNN(nn.Module):
         in_bits: int,
         num_classes: int,
         lut_input_size: int = 6,
+        lut_input_size_list: Optional[List[int]] = None,  # 如果提供這個，就用裡面的 lut_input_size；沒有就全用 lut_input_size 這個單一值
         hidden_luts=(2000, 1000),
         mapping=None,
         tau: float = 1.0,
@@ -44,66 +46,70 @@ class MultiLayerWNN(nn.Module):
         self.register_buffer("exit1_mu", torch.empty(0))
         self.register_buffer("exit1_sigma", torch.empty(0))'''
         # 每層 dropout schedule
-        drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
+        # inside MultiLayerWNN.__init__ after defining layers=[], prev_bits=in_bits, etc.
 
-        
+        # 1) dropout schedule
+        drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
+        # 如果你真的要手動指定，建議用參數傳進來，而不是這裡 hardcode
+        # drop_ps = [0.1, 0.0]
+
+        # 2) lut_input_size per-layer
+        if lut_input_size_list is not None:
+            assert len(lut_input_size_list) == len(hidden_luts), \
+                f"lut_input_size_list len {len(lut_input_size_list)} must match hidden_luts len {len(hidden_luts)}"
+        else:
+            lut_input_size_list = [lut_input_size] * len(hidden_luts)
+
         for i, n_lut in enumerate(hidden_luts):
-            layer_mapping = mapping if i == 0 else None
-            binarize_input = True if i == 0 else False  # 只有第一層需要 binarize（因為輸入是 bitplane）；後面層的輸入已經是 0/1 LUT output，不需要再 binarize
-            '''layers.append(
-                WNNLUTLayer(
-                    in_bits=prev_bits,
-                    num_luts=n_lut,
-                    lut_input_size=lut_input_size,
-                    mapping=layer_mapping,
-                    binarize_input=binarize_input,
-                    dropout_p=drop_ps[i],
-                )
-            )'''
-            # example for CIFAR10 RGB bitplane:
-            # in_bits = 3*32*32*8 = 24576
+            k_i = int(lut_input_size_list[i])
+
+            # layer0: input is bitplane (0/1) so binarize_input=True is OK
+            # later: your LUT output is real-valued -> binarize_input=False
+            binarize_input = True if i == 0 else False
+
             if i == 0:
-                conn0 = build_patch_local_conn_idx_bitmajor(
+                # NOTE: conn0 must be built using k_i (not the global lut_input_size)
+                conn0 = build_conn0_rgb_thermo_sobel_v2(
                     num_luts=n_lut,
-                    lut_input_size=lut_input_size,
-                    H=32, W=32, C=3,
-                    bits_per_channel=8,
-                    patch=(4,4),
-                    global_frac=0.2,   # 我建議先 0.2，降低 dup
+                    k=k_i,
+                    frac_thermo=0.22,
+                    frac_sobel=0.33,
+                    patch=(6, 6),
                     seed=42,
                     device="cpu",
-                )
-                conn_idx = conn0.to(torch.long).cpu()
+                    sobel_jitter_p=0.0,
+                    sobel_global_frac=0.24,
+                ).to(torch.long).cpu()
+                conn_idx = conn0
             else:
-                conn_idx = None  # later layers use random conn_idx by default; you can also build custom ones like conn0 if you want
-            
-            layers.append(
-                WNNLUTLayer(
-                    in_bits=prev_bits,
-                    num_luts=n_lut,
-                    lut_input_size=lut_input_size,
-                    conn_idx=conn_idx,          # ✅ only for layer0
-                    mapping=None,
-                    binarize_input=True,    # ✅ bitplane already 0/1
-                    dropout_p=dropout_p,
-                )
-            )
+                conn_idx = None  # later layers random wiring
 
-            # later layers keep random conn (conn_idx=None, mapping=None)
+            layer = WNNLUTLayer(
+                in_bits=prev_bits,
+                num_luts=n_lut,
+                lut_input_size=k_i,        # ✅ 這行就是修正 A 的核心
+                conn_idx=conn_idx,
+                mapping=None,
+                binarize_input=binarize_input,
+                dropout_p=drop_ps[i],
+                init_std=0.05,
+                # 你有跑 adaptive threshold，但目前 forward 沒用到它；
+                # 先保持預設不影響現有結果
+            )
+            layers.append(layer)
 
             if i == 0:
-                print("layer0 conn idx uses mapping?", layers[0].conn_idx[:5])
+                print("layer0 conn idx preview:", layers[0].conn_idx[:5])
                 print("layer0 conn idx max:", layers[0].conn_idx.max().item(), "in_bits:", layers[0].in_bits)
 
             self.layer_in_bits.append(prev_bits)
             self.layer_out_luts.append(n_lut)
             prev_bits = n_lut
 
-        self.layers = nn.ModuleList(layers)
-        self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
-
-        # for hidden pruning
-        self.register_buffer("keep_idx", torch.empty(0, dtype=torch.long))
+            self.layers = nn.ModuleList(layers)
+            self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
+            # for hidden pruning
+            self.register_buffer("keep_idx", torch.empty(0, dtype=torch.long))
 
     # helper
     def enable_exit1(self, K: int, num_classes: int, bias: bool = True, exit_tau: float = 1.0, device=None):

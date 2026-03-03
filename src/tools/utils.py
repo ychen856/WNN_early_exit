@@ -310,3 +310,44 @@ def debug_conn_idx(conn_idx: torch.Tensor, in_bits: int, name="conn"):
     print(f"[{name}] unique={uniq.numel()} / total={flat.numel()} (dup_rate={(1-uniq.numel()/flat.numel()):.3f})")
     # where does it concentrate
     print(f"[{name}] uniq min/max = {int(uniq.min())}/{int(uniq.max())}")
+
+
+import torch
+
+def summarize_conn0(conn0: torch.Tensor, total_bits: int = None, max_show: int = 10):
+    """
+    conn0: [num_luts, k] LongTensor
+    """
+    assert conn0.dim() == 2
+    num_luts, k = conn0.shape
+
+    # oob / neg sanity
+    neg = (conn0 < 0).sum().item()
+    oob = 0
+    if total_bits is not None:
+        oob = (conn0 >= total_bits).sum().item()
+
+    # per-LUT unique count (effective-k)
+    uniq_counts = torch.tensor([len(set(row.tolist())) for row in conn0], dtype=torch.long)
+
+    # stats
+    print(f"[conn0] shape=({num_luts},{k}) neg={neg} oob={oob}")
+    print(f"[conn0] effective-k: mean={uniq_counts.float().mean().item():.3f} "
+          f"min={uniq_counts.min().item()} p5={int(torch.quantile(uniq_counts.float(), 0.05).item())} "
+          f"p50={int(torch.quantile(uniq_counts.float(), 0.50).item())} "
+          f"p95={int(torch.quantile(uniq_counts.float(), 0.95).item())} "
+          f"max={uniq_counts.max().item()}")
+
+    # how many LUTs have duplicates
+    dup_luts = (uniq_counts < k).sum().item()
+    print(f"[conn0] LUTs with duplicates: {dup_luts}/{num_luts} ({dup_luts/num_luts:.3%})")
+
+    # show a few examples with worst uniq counts
+    worst = torch.argsort(uniq_counts)[:max_show].tolist()
+    print("[conn0] worst LUT examples (idx: uniq_count, row):")
+    for i in worst:
+        row = conn0[i].tolist()
+        print(f"  {i}: {uniq_counts[i].item()}  {row}")
+
+# 用法：
+# summarize_conn0(conn0, total_bits=40960)

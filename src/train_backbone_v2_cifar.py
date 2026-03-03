@@ -6,7 +6,6 @@ import json
 import torch
 import torch.nn.functional as F
 import torch.utils.data as d
-from torch.utils.data import DataLoader, random_split
 from src.core.wisard import build_cifar10_layer0_mapping
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
 from src.dataio.data import build_loaders_bits
@@ -76,12 +75,26 @@ def train_model(
     grad_clip=1.0,
     early_stop_patience=0, # 0 = 不 early stop；建議先設 8
 ):
-    optimizer = torch.optim.AdamW(
+    '''optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=base_lr,
         weight_decay=weight_decay
-    )
+    )'''
+    # assume model has model.layers = nn.ModuleList([...])
+    table0 = model.layers[0].table
+    table1 = model.layers[1].table
 
+    # collect "rest" params by id exclusion (most robust)
+    exclude = {id(table0), id(table1)}
+    rest_params = [p for p in model.parameters() if id(p) not in exclude]
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [table0], "lr": base_lr, "weight_decay": 1e-2},
+            {"params": [table1], "lr": base_lr, "weight_decay": 3e-2},   # you can try 5e-2, 1e-1
+            {"params": rest_params, "lr": base_lr, "weight_decay": 1e-4},
+        ]
+    )
     '''# Cosine decay: lr 從 base_lr -> eta_min
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -92,7 +105,7 @@ def train_model(
         optimizer, mode="max", factor=0.5, patience=3, threshold=1e-3, verbose=True
     )'''
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, threshold=5e-4, verbose=True
+        optimizer, mode="max", factor=0.5, patience=4, threshold=5e-4, verbose=True
     )
 
     best_state = None
@@ -157,6 +170,9 @@ def train_model(
         # ---- step scheduler (cosine: 每 epoch step) ----
         #scheduler.step()
         scheduler.step(val_acc)
+
+        # debug
+        print("layer1 table std:", model.layers[1].table.data.std().item())
 
         # optional: print lr
         cur_lr = optimizer.param_groups[0]["lr"]
@@ -274,10 +290,15 @@ if __name__ == "__main__":
     )
 
 
-    lut_input_size = 4
-    hidden_luts = (6000, 2000)  # 可以先不動，等後續 pruned backbone 再調整
+    #把 conn0 做成「分 bucket 抽樣」+「去重」
+    #sobel bits 不要用 “global threshold ratio”，改成 “per-image adaptive”
+    
 
-    # CIFAR10: C=3, H=W=32
+    lut_input_size = 9  # 3 for MNIST, 2 for KMNIST; you can also treat it as a tunable hyperparameter and try different values
+    hidden_luts = [6000, 4000]  # 可以先不動，等後續 pruned backbone 再調整
+
+    print(ds_meta)
+    '''# CIFAR10: C=3, H=W=32
     first_layer_mapping = build_cifar10_layer0_mapping(
         num_luts=hidden_luts[0],
         k=lut_input_size,
@@ -285,20 +306,21 @@ if __name__ == "__main__":
         C=ds_meta.channels,
         seed=42,
         device="cpu",
-    )
+    )'''
 
     backbone_cfg = dict(
         arch="MultiLayerWNN",
         in_bits=in_bits,
         num_classes=C,
         lut_input_size=lut_input_size,
+        lut_input_size_list=[9, 5],
         hidden_luts=hidden_luts,
         tau=0.165,
         #tau=0.5,
         mapping=None,
         #mapping=first_layer_mapping,
         dropout_p=args.dropout_p,  # ✅ 新增：給 MultiLayerWNN 再往下傳
-        dataset_meta=dict(name=ds_meta.name, z=ds_meta.z)
+        #dataset_meta=dict(name=ds_meta.name, z=ds_meta.z)
     )
 
 
@@ -322,7 +344,7 @@ if __name__ == "__main__":
     uniq = torch.unique(model.layers[0].conn_idx).numel()
     print("coverage:", uniq / float(in_bits))
 
-    model = train_model(model, train_loader, val_loader, device, num_epochs=60, base_lr=args.base_lr, weight_decay=args.weight_decay)
+    model = train_model(model, train_loader, val_loader, device, num_epochs=20, base_lr=args.base_lr, weight_decay=args.weight_decay)
     
     '''rep = lut_pattern_coverage(
         model.layers[0],

@@ -555,3 +555,297 @@ def bitplane_encode_u8_gray(x_u8: torch.Tensor, bits: int = 8) -> torch.Tensor:
     b = (x.unsqueeze(-1) >> shifts) & 1  # [N,H,W,bits]
     b = b.to(torch.float32)
     return b.reshape(x.size(0), -1)
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+def sobel_edge_bits_batch(x_u8: torch.Tensor, ratio: float = 0.2) -> torch.Tensor:
+    """
+    x_u8: [B,H,W] uint8 (0..255)
+    return: [B, H*W] float {0,1}
+    """
+    assert x_u8.ndim == 3
+    x = x_u8.float().unsqueeze(1)  # [B,1,H,W]
+
+    kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=x.device).view(1,1,3,3)
+    ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=x.device).view(1,1,3,3)
+
+    gx = F.conv2d(x, kx, padding=1)
+    gy = F.conv2d(x, ky, padding=1)
+    mag = torch.sqrt(gx*gx + gy*gy + 1e-8).squeeze(1)  # [B,H,W]
+
+    # per-image threshold
+    mmax = mag.flatten(1).amax(dim=1, keepdim=True)  # [B,1]
+    thr  = ratio * mmax
+    bits = (mag.flatten(1) > thr).float()            # [B,H*W]
+    return bits
+
+
+def encode_gray_thermo_plus_sobel_batch(
+    x_u8: torch.Tensor,                 # [B,H,W] uint8
+    thresholds: torch.Tensor,            # [L] float (CPU or device 都行)
+    xmin: torch.Tensor,                  # [1,D] float
+    xmax: torch.Tensor,                  # [1,D] float
+    sobel_ratio: float = 0.2,
+) -> torch.Tensor:
+    """
+    returns bits: [B, D_thermo + H*W] float32 {0,1}
+    """
+    device = x_u8.device
+
+    # thermo: [B, H*W*L]
+    thermo_bits = dt_thermometer_encode(
+        x_u8, thresholds=thresholds, xmin=xmin, xmax=xmax
+    ).to(device)
+
+    # sobel: [B, H*W]
+    sobel_bits = sobel_edge_bits_batch(x_u8, ratio=sobel_ratio).to(device)
+    print("sobel_gray_bits shape:", sobel_bits.shape)
+
+    return torch.cat([thermo_bits, sobel_bits], dim=1)
+
+
+
+
+################################
+# compute 2-level sobel thresholds from train set
+###############################
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def sobel_mag_gray_u8_batch(gray_u8: torch.Tensor, device=None) -> torch.Tensor:
+    """
+    gray_u8: [B,H,W] uint8 (0..255)
+    return:  mag [B,H,W] float32
+    """
+    if device is None:
+        device = gray_u8.device
+    x = gray_u8.to(device).float() / 255.0  # [B,H,W]
+    x = x.unsqueeze(1)  # [B,1,H,W]
+
+    kx = torch.tensor([[-1, 0, 1],
+                       [-2, 0, 2],
+                       [-1, 0, 1]], dtype=torch.float32, device=device).view(1,1,3,3)
+    ky = torch.tensor([[-1,-2,-1],
+                       [ 0, 0, 0],
+                       [ 1, 2, 1]], dtype=torch.float32, device=device).view(1,1,3,3)
+
+    gx = F.conv2d(x, kx, padding=1)
+    gy = F.conv2d(x, ky, padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy + 1e-8)  # [B,1,H,W]
+    return mag[:, 0]  # [B,H,W]
+
+@torch.no_grad()
+def compute_sobel_two_thresholds(
+    train_gray_u8: torch.Tensor,
+    q1: float = 0.80,
+    q2: float = 0.92,
+    max_samples: int = 10000,
+    device: str = "cpu",
+) -> tuple[float, float]:
+    """
+    用 train 的 sobel magnitude 取兩個 quantile 當 threshold。
+    回傳 (t1, t2)，且保證 t2 >= t1。
+    """
+    assert train_gray_u8.dim() == 3, f"expected [N,H,W], got {train_gray_u8.shape}"
+    N = train_gray_u8.size(0)
+    if N > max_samples:
+        idx = torch.randperm(N)[:max_samples]
+        gray = train_gray_u8[idx]
+    else:
+        gray = train_gray_u8
+
+    mag = sobel_mag_gray_u8_batch(gray, device=device)  # [B,H,W]
+    v = mag.flatten()  # [B*H*W]
+    t1 = float(torch.quantile(v, q1).item())
+    t2 = float(torch.quantile(v, q2).item())
+    if t2 < t1:
+        t1, t2 = t2, t1
+    return t1, t2
+
+
+##############################
+# sobel 2-level encoding
+##############################
+@torch.no_grad()
+def sobel_2level_bits_gray_u8(
+    gray_u8: torch.Tensor,
+    t1: float,
+    t2: float,
+    device=None,
+) -> torch.Tensor:
+    """
+    gray_u8: [B,H,W] uint8
+    return: bits [B, H*W*2] float32 {0,1}
+    layout: pixel-major, then level(0=t1, 1=t2)
+    """
+    if device is None:
+        device = gray_u8.device
+    mag = sobel_mag_gray_u8_batch(gray_u8, device=device)  # [B,H,W]
+    b1 = (mag > t1).to(torch.float32)  # [B,H,W]
+    b2 = (mag > t2).to(torch.float32)  # [B,H,W]
+
+    B, H, W = b1.shape
+    # pixel-major then level: [B, H*W, 2] -> [B, H*W*2]
+    bits = torch.stack([b1, b2], dim=-1).view(B, H * W * 2)
+    return bits
+
+@torch.no_grad()
+def encode_gray_thermo_plus_sobel2_batch(
+    gray_u8: torch.Tensor,             # [B,32,32] uint8
+    thermo_bits: torch.Tensor,          # [B, H*W*thermo_levels] float {0,1}
+    sobel_t1: float,
+    sobel_t2: float,
+    device=None,
+) -> torch.Tensor:
+    """
+    concat: [THERMO (pixel-major, thermo_levels)] + [SOBEL2 (pixel-major, 2 levels)]
+    return: [B, H*W*thermo_levels + H*W*2]
+    """
+    if device is None:
+        device = gray_u8.device
+
+    sobel2 = sobel_2level_bits_gray_u8(gray_u8.to(device), sobel_t1, sobel_t2, device=device)
+    print("sobel2 bits shape:", sobel2.shape)
+
+    out = torch.cat([thermo_bits.to(device), sobel2], dim=1)
+    return out
+
+
+
+
+
+
+
+
+
+def bucket_id_from_global_idx(
+    idx: int,
+    *,
+    H: int = 32,
+    W: int = 32,
+    C: int = 3,
+    rgb_bits_per_channel: int = 2,   # 你目前最好的設定
+    thermo_levels: int = 32,
+    tile: int = 4,                   # 你 patch=4x4，tile 也用 4 最直覺
+    D_rgb: int = 6144,
+    D_thermo: int = 32768,
+    D_sobel: int = 1024,
+) -> str:
+    """
+    concat layout:
+      [0, D_rgb) -> rgb bitplane (pixel-major: ((c*H+y)*W+x)*B + b)
+      [D_rgb, D_rgb+D_thermo) -> gray thermo (pixel-major: (y*W+x)*L + level)
+      [D_rgb+D_thermo, end) -> gray sobel (pixel-major: y*W+x)
+
+    returns a bucket string like:
+      RGB_T(ty,tx)_C{c}_B{b}
+      TH_T(ty,tx)_G{g}   (g = level group)
+      SB_T(ty,tx)
+    """
+    assert 0 <= idx < (D_rgb + D_thermo + D_sobel)
+
+    offset_rgb = 0
+    offset_th  = D_rgb
+    offset_sb  = D_rgb + D_thermo
+
+    # --- RGB ---
+    if idx < offset_th:
+        j = idx - offset_rgb
+        pix = j // rgb_bits_per_channel
+        b = j % rgb_bits_per_channel
+        x = pix % W
+        y = (pix // W) % H
+        c = pix // (H * W)
+        tx = x // tile
+        ty = y // tile
+        return f"RGB_T{ty:02d}{tx:02d}_C{c}_B{b}"
+
+    # --- THERMO ---
+    if idx < offset_sb:
+        j = idx - offset_th
+        pix = j // thermo_levels
+        level = j % thermo_levels
+        x = pix % W
+        y = pix // W
+        tx = x // tile
+        ty = y // tile
+        # level-group: 32 -> 4 groups (0-7,8-15,16-23,24-31)
+        g = level // (thermo_levels // 4)
+        return f"TH_T{ty:02d}{tx:02d}_G{g}"
+
+    # --- SOBEL ---
+    j = idx - offset_sb
+    x = j % W
+    y = j // W
+    tx = x // tile
+    ty = y // tile
+    return f"SB_T{ty:02d}{tx:02d}"
+
+
+
+
+
+def bucket_id_from_global_idx_rgb_th_sobel2(idx: int):
+    H=W=32
+    C=3
+    rgb_bits=2
+    th_levels=32
+    sb_levels=2
+
+    D_rgb = C*H*W*rgb_bits       # 6144
+    D_th  = H*W*th_levels        # 32768
+    D_sb  = H*W*sb_levels        # 2048
+    total_bits = D_rgb + D_th + D_sb  # 40960
+
+    if idx < 0 or idx >= total_bits:
+        raise ValueError(idx)
+
+    # RGB
+    if idx < D_rgb:
+        local = idx
+        pix = local // rgb_bits              # 0..(3*H*W-1)
+        b = local % rgb_bits               # 0..1
+
+        c = pix // (H * W)                   # 0..2
+        pix_in_c = pix % (H * W)             # 0..1023
+
+        x = pix_in_c % W
+        y = pix_in_c // W
+
+        tx = x // 4
+        ty = y // 4
+        return f"RGB_C{c}_T{tx}{ty}_b{b}"    # ✅ RGB_ 前綴 OK
+
+    # TH
+    if idx < D_rgb + D_th:
+        local = idx - D_rgb
+        pix = local // th_levels
+        lvl = local % th_levels
+        x = pix % W
+        y = pix // W
+        tx = x // 4
+        ty = y // 4
+        lh = "L" if lvl < (th_levels//2) else "H"
+        return f"TH_T{tx}{ty}_{lh}_l{lvl}"
+
+    # SB2
+    local = idx - (D_rgb + D_th)
+    pix = local // sb_levels
+    lvl = local % sb_levels
+    x = pix % W
+    y = pix // W
+    tx = x // 4
+    ty = y // 4
+    return f"SB2_T{tx}{ty}_l{lvl}"          # ✅ 建議用 SB2_，避免你 code 期待 SB2

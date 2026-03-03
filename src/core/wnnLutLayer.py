@@ -20,7 +20,7 @@ class WNNLUTLayer(nn.Module):
         lut_input_size: int = 6,
         mapping=None,
         conn_idx=None,
-        init_std: float = 0.01,
+        init_std: float = 0.05,
         dropout_p = 0.2,
         binarize_input = True,
 
@@ -93,6 +93,39 @@ class WNNLUTLayer(nn.Module):
         table = table.normal_(mean=0.0, std=init_std)
         self.table = nn.Parameter(table)
 
+
+    def forward_idk(self, x_bits):
+        B = x_bits.size(0)
+        device = x_bits.device
+
+        # ✅ 對 layer0 和 layer>=1 用不同 threshold 規則（用輸入範圍判斷最穩）
+        # - bitplane / binary: {0,1} -> 用 0.5
+        # - sigmoid output: (0,1)   -> 用 0.5
+        # - 若未來你改成 logits/centered，再考慮用 0.0 或 median
+        if self.binarize_input:
+            x_bits = (x_bits > 0.5).float()
+
+        bits = x_bits[:, self.conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
+        bits = (bits > 0.5).long()
+        
+        idx = torch.zeros(B, self.num_luts, dtype=torch.long, device=device)
+        for j in range(self.lut_input_size):
+            idx = idx * 2 + bits[:, :, j]
+
+        table_expanded = self.table.unsqueeze(0).expand(B, -1, -1)
+        out = torch.gather(table_expanded, 2, idx.unsqueeze(-1)).squeeze(-1)
+
+        if self.binarize_input:
+            out = torch.sigmoid(out)   # 先保留（CIFAR 通常需要）
+            out = self.dropout(out)
+        return out
+
+
+
+
+
+
+
     def forward(self, x_bits):
         B = x_bits.size(0)
         device = x_bits.device
@@ -100,32 +133,16 @@ class WNNLUTLayer(nn.Module):
         # Extract k bits for each LUT
         bits = x_bits[:, self.conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
 
-        # Address bits must be 0/1
-        '''if self.binarize_input:
-            # for LUT outputs (real, around 0)
-            bits = (bits > 0.0).to(torch.long)
-        else:
-            # for bitplane input (0/1)
-            bits = (bits > 0.5).to(torch.long)'''
-        if self.binarize_input:
-            # layer0：bitplane already 0/1
-            bits = (bits > 0.5).long()
-        else:
-            # layer>=1：dynamic threshold，避免全 0 / 全 1
-            thr = bits.median(dim=0, keepdim=True).values   # [1, num_luts, k]
-            bits = (bits > thr).long()
-
-
-        bits = x_bits[:, self.conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
 
         if self.binarize_input:
-            # layer>=1: 用動態 threshold，避免全 0 / 全 1
-            # 這個 thr 是針對每個 LUT-input 位置算的（k 維），很便宜也很穩
-            thr = bits.median(dim=0, keepdim=True).values   # [1, num_luts, k]
-            bits = (bits > thr).to(torch.long)
-        else:
-            # layer0: bitplane 已經是 0/1
             bits = (bits > 0.5).to(torch.long)
+        else:
+            mu = bits.mean(dim=0, keepdim=True)
+            sigma = bits.std(dim=0, keepdim=True) + 1e-6
+            bits = ((bits - mu) / sigma > 0).long()
+            #bits = (bits > 0.0).to(torch.long)
+
+        #bits = (bits > 0.5).to(torch.long)
         
         #print(f'bits one rate: {(bits > 0).float().mean().item():.4f}, std: {bits.float().std().item():.4f}, min: {bits.min().item()}, max: {bits.max().item()}')
         
@@ -134,17 +151,39 @@ class WNNLUTLayer(nn.Module):
         for j in range(self.lut_input_size):
             idx = idx * 2 + bits[:, :, j]
 
-        #print("layer1 bits ones rate", bits.float().mean().item(),
-        #    "unique idx", torch.unique(idx).numel())
+        '''print("layer1 bits ones rate", bits.float().mean().item(),
+            "unique idx", torch.unique(idx).numel())'''
 
-
+        ''' print("table stats: mean {:.4f} std {:.4f} min {:.4f} max {:.4f}".format(
+            self.table.mean().item(), self.table.std().item(),
+            self.table.min().item(), self.table.max().item()
+        ))'''
         table_expanded = self.table.unsqueeze(0).expand(B, -1, -1)
+        
         out = torch.gather(table_expanded, 2, idx.unsqueeze(-1)).squeeze(-1)
 
-        out = self.dropout(out)
+        if not self.binarize_input:
+            out = self.dropout(out)
+            #out = torch.sigmoid(out)
+        else:
+            out = self.dropout(out)
+            #print("pre-act out std:", out.detach().std().item())
+            '''out_sign = out.sign()
+            out = out + (out_sign - out).detach()'''
         #print(f'out mean: {out.mean().item():.4f}, std: {out.std().item():.4f}, min: {out.min().item()}, max: {out.max().item()}')
         return out
     
+
+
+
+
+
+
+
+
+
+
+
 
     def forward_temp(self, x_bits):
         B = x_bits.size(0)
@@ -158,6 +197,7 @@ class WNNLUTLayer(nn.Module):
         else:
             thr = x_bits.median(dim=0, keepdim=True).values
             x_bits = (x_bits > thr).float()'''
+        
         if self.binarize_input:
             #x_bits = (x_bits > 0.5).float()
             x_bits = (x_bits > 0.0).float()
@@ -193,7 +233,7 @@ class WNNLUTLayer(nn.Module):
         out = torch.gather(table_expanded, 2, idx.unsqueeze(-1)).squeeze(-1)
 
         # sigmoid activation (same as PyTorch version   )
-        out = torch.sigmoid(out)
+        #out = torch.sigmoid(out)
         #out = out.clamp(-5, 5)
         out = self.dropout(out)
 
