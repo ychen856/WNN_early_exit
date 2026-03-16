@@ -373,7 +373,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--output-dir", type=str, default="./outputs/ivitt_backbone")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=8)
+    
+    # Detect container environment for num_workers default
+    default_workers = 0 if (os.path.exists('/.dockerenv') or 'KUBERNETES_SERVICE_HOST' in os.environ) else 8
+    parser.add_argument("--num-workers", type=int, default=default_workers,
+                        help=f"Number of data loading workers (default: {default_workers} for container safety)")
+    
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--warmup-epochs", type=int, default=5)
@@ -502,22 +507,34 @@ def build_datasets(cfg: TrainConfig):
 
 def build_loaders(cfg: TrainConfig):
     train_set, val_set = build_datasets(cfg)
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-        drop_last=False,
-    )
+    
+    # Safely create DataLoaders with fallback for SHM-constrained environments
+    def create_loader(dataset, is_train=True, workers=cfg.num_workers):
+        try:
+            loader = DataLoader(
+                dataset,
+                batch_size=cfg.batch_size,
+                shuffle=is_train,
+                num_workers=workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=is_train,
+            )
+            return loader
+        except RuntimeError as e:
+            if workers > 0 and ("shared memory" in str(e) or "shm" in str(e)):
+                print(f"[WARNING] SHM error with num_workers={workers}. Retrying with num_workers=0...")
+                return DataLoader(
+                    dataset,
+                    batch_size=cfg.batch_size,
+                    shuffle=is_train,
+                    num_workers=0,
+                    pin_memory=cfg.pin_memory,
+                    drop_last=is_train,
+                )
+            raise
+    
+    train_loader = create_loader(train_set, is_train=True, workers=cfg.num_workers)
+    val_loader = create_loader(val_set, is_train=False, workers=cfg.num_workers)
     return train_loader, val_loader, cfg
 
 def save_best_checkpoint_atomic(
@@ -567,6 +584,18 @@ def save_best_fn(epoch, model, optimizer, scheduler, best_val_acc, output_dir):
 def main():
     cfg = parse_args()
     set_seed(cfg.seed)
+    
+    # Warn about container SHM issues if not mitigated
+    in_container = os.path.exists('/.dockerenv') or 'KUBERNETES_SERVICE_HOST' in os.environ
+    if in_container and cfg.num_workers > 0:
+        print("=" * 70)
+        print("[WARNING] Running in containerized environment with num_workers > 0")
+        print("[WARNING] This may cause 'unable to allocate shared memory' errors")
+        print("[WARNING] Mitigation options:")
+        print(f"           1. Use --num-workers 0 (current: {cfg.num_workers})")
+        print("           2. Increase container SHM: docker run --shm-size=4gb ...")
+        print("           3. For Kubernetes, set: emptyDir.sizeLimit in pod spec")
+        print("=" * 70)
     
     print(cfg)
 
