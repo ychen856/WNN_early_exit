@@ -4,30 +4,137 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 from typing import List, Tuple, Optional, List
-
-from src.core.wisard import build_conn0_from_buckets, build_conn0_from_buckets_2, build_conn0_from_buckets_3, build_conn0_from_buckets_4, build_conn0_hybrid_from_buckets, build_conn0_rgb_thermo_sobel_v2
+from src.core.wisard import LearnableConnTopK, build_conn0_from_buckets, build_conn0_from_buckets_2, build_conn0_from_buckets_3, build_conn0_from_buckets_4, build_conn0_hybrid_from_buckets, build_conn0_rgb_thermo_sobel_v2
 from src.core.wnnLutLayer import WNNLUTLayer
+from src.core.wnnLutLayerSoftConn import WNNLUTLayerSoftConn
 from src.dataio.encode import bucket_id_from_global_idx, bucket_id_from_global_idx_rgb_th_sobel2
 from src.exit.ckpt_exit import normalize_exit_cfg_list
 from src.tools.utils import get_exit1_features, make_dropout_schedule, summarize_conn0
 
 
 class MultiLayerWNN(nn.Module):
+    """
+    Quasi-Weightless Transformers (QuWeiT) Multi-Layer Neural Network with DWB (Differentiable Weightless Blocks).
+    
+    Paper: "Shrinking the Giant: Quasi-Weightless Transformers for Low Energy Inference"
+    arXiv:2411.01818v1
+    
+    Architecture Overview:
+    =====================
+    This model implements energy-efficient LUT-based neural networks that replace transformer MLPs with
+    Differentiable Weightless Blocks (DWB). Each layer follows the pattern:
+    
+        Input bits → LUT table lookup → Binary outputs → Conditional summation → Real-valued features
+    
+    Layer Configuration:
+    -------------------
+    Layer 0 (Hard-wired connections):
+        - Fixed mapping: RGB image → Thermometer encoding → Sobel features
+        - Input: in_bits (2048 for 32×32×8bit CIFAR)
+        - LUT table: [num_luts[0], 2^k] where k=lut_input_size[0]=9
+        - Output: [B, num_luts[0]] binary values
+        - With DWB: [B, encoded_values_out_dim] real-valued features via conditional summation
+    
+    Layer 1 (Learnable connections):
+        - Learnable bit selection via Gumbel-softmax
+        - Input: encoded_values_out_dim (from Layer 0) or num_luts[0] (without DWB)
+        - LUT table: [num_luts[1], 2^k] where k=lut_input_size[1]=5
+        - Output: [B, num_luts[1]] binary values
+        - With DWB: [B, encoded_values_out_dim] real-valued features via conditional summation
+    
+    Classifier:
+        - Linear projection from final layer outputs to class logits
+        - Input: encoded_values_out_dim (with DWB) or num_luts[1] (without DWB)
+        - Output: [B, num_classes]
+    
+    Differentiable Weightless Block (DWB) Mechanism:
+    ================================================
+    Instead of standard neural network layers with weight matrices, DWB uses:
+    
+    1. **Conditional Summation** (key innovation):
+        binary_out = (lut_output > 0).float()           # [B, num_luts]
+        output = (binary_out.unsqueeze(-1) × encoded_values).sum(dim=1)  # [B, encoded_dim]
+    
+    2. **Benefits**:
+        - No multiplications: addition-only operations (efficient hardware)
+        - Real-valued outputs: smooth gradient flow for training
+        - Learnable features: encoded_values optimized via backprop
+        - Parameter reduction: ~66% elimination vs standard MLPs
+        - Energy efficiency: ~2.2x improvement, 55% MAC reduction
+    
+    3. **Training Dynamics**:
+        - Extended Finite Differentiation enables end-to-end gradients
+        - Gumbel-softmax for learning connection patterns
+        - 3-phase temperature schedule: exploration → transition → commitment
+        - Entropy regularization guides learning
+    
+    Parameters:
+    -----------
+    in_bits: int
+        Input dimension (e.g., 2048 for CIFAR-10 with thermometer encoding)
+    num_classes: int
+        Number of output classes (e.g., 10 for CIFAR)
+    lut_input_size: int
+        Default LUT input size (bits per LUT). Overridden by lut_input_size_list if provided.
+    lut_input_size_list: Optional[List[int]]
+        Per-layer LUT input sizes (e.g., [9, 5] for layers 0 and 1)
+    hidden_luts: tuple
+        Number of LUTs per layer (e.g., (2000, 1000))
+    mapping: Optional
+        Pre-computed bit-to-LUT mapping (None = use built-in thermo+sobel for layer 0)
+    tau: float
+        Temperature scaling for final classifier logits (default: 1.0)
+    exit_tau: float
+        Temperature scaling for early exit heads (default: 1.0)
+    dropout_p: float or str
+        Dropout probability schedule (e.g., "0.2,0.15" for per-layer rates)
+    encoded_values_out_dim: Optional[int]
+        **DWB FEATURE**: Dimension of encoded values per LUT layer.
+        - If None: Standard LUT outputs (binary), no DWB
+        - If int: Enable DWB with this output dimension
+        - Example: encoded_values_out_dim=8 → [B, 8] output per DWB layer
+    
+    Example Usage:
+    ---------------
+    # Without DWB (standard WNN)
+    model = MultiLayerWNN(in_bits=2048, num_classes=10, hidden_luts=(2000, 1000))
+    x = torch.randn(32, 2048)  # Batch of 32 encoded images
+    logits = model(x)  # [32, 10]
+    
+    # With DWB (Quasi-Weightless Transformers)
+    model = MultiLayerWNN(
+        in_bits=2048, 
+        num_classes=10, 
+        hidden_luts=(2000, 1000),
+        encoded_values_out_dim=8,  # Enable DWB with 8-D features
+    )
+    x = torch.randn(32, 2048)
+    logits = model(x)  # [32, 10], with internal transformations via 8-D representations
+    
+    References:
+    -----------
+    - DWB paper: arXiv:2411.01818v1
+    - Prior DWN work: Bacellar et al. 2024 (Extended Finite Differentiation)
+    - Thermometer encoding: Widely used in weightless networks
+    - Gumbel-softmax: Jang et al. 2017 (differentiable sampling)
+    """
     def __init__(
         self,
         in_bits: int,
         num_classes: int,
         lut_input_size: int = 6,
-        lut_input_size_list: Optional[List[int]] = None,  # 如果提供這個，就用裡面的 lut_input_size；沒有就全用 lut_input_size 這個單一值
+        lut_input_size_list: Optional[List[int]] = None,
         hidden_luts=(2000, 1000),
         mapping=None,
         tau: float = 1.0,
         exit_tau: float = 1.0,
-        dropout_p=0.0
+        dropout_p=0.0,
+        encoded_values_out_dim: Optional[int] = None,
     ):
         super().__init__()
         self.tau = tau
         self.exit1_use_norm = False  # 是否對 exit1 features 做 mu/sigma normalization；建議預設 False，除非你確定要用且已經準備好 mu/sigma buffer
+        self.encoded_values_out_dim = encoded_values_out_dim
 
         layers = []
         prev_bits = in_bits
@@ -51,7 +158,8 @@ class MultiLayerWNN(nn.Module):
         # 1) dropout schedule
         drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
         # 如果你真的要手動指定，建議用參數傳進來，而不是這裡 hardcode
-        # drop_ps = [0.1, 0.0]
+        drop_ps = [0.2, 0.15]
+        init_std_list = [0.05, 0.01]
 
         # 2) lut_input_size per-layer
         if lut_input_size_list is not None:
@@ -60,12 +168,55 @@ class MultiLayerWNN(nn.Module):
         else:
             lut_input_size_list = [lut_input_size] * len(hidden_luts)
 
-        for i, n_lut in enumerate(hidden_luts):
+
+
+
+        # layer0 (existing hard LUT)
+        conn0 = build_conn0_rgb_thermo_sobel_v2(
+                    num_luts=hidden_luts[0],
+                    k=lut_input_size_list[0],
+                    frac_thermo=0.22,
+                    frac_sobel=0.33,
+                    patch=(6, 6),
+                    seed=42,
+                    device="cpu",
+                    sobel_jitter_p=0.0,
+                    sobel_global_frac=0.24,
+                ).to(torch.long).cpu()
+        
+        layer0 = WNNLUTLayer(
+            in_bits=in_bits, num_luts=hidden_luts[0], lut_input_size=lut_input_size_list[0],
+            conn_idx=conn0, binarize_input=True, dropout_p=0.2,
+            init_std=0.05,
+            encoded_values_out_dim=encoded_values_out_dim  # DWB support
+        )
+
+        # Determine layer1 input dimension based on whether DWB is enabled
+        layer1_in_bits = encoded_values_out_dim if encoded_values_out_dim is not None else hidden_luts[0]
+        
+        # layer1 (learnable conn + soft LUT train)
+        layer1 = WNNLUTLayerSoftConn(
+            in_bits=layer1_in_bits, num_luts=hidden_luts[1], k=lut_input_size_list[1],
+            M=128, init_std=0.02, dropout_p=0.0,
+            seed=42,
+            use_gumbel=True, gumbel_tau=2.0,
+            binarize_mode="sign",   # 你現在 layer1 用 sign 效果最好
+            encoded_values_out_dim=encoded_values_out_dim  # DWB support
+        )
+
+        self.layers = nn.ModuleList([layer0, layer1])
+        
+        # Determine classifier input dimension based on whether DWB is enabled on final layer
+        classifier_in_dim = encoded_values_out_dim if encoded_values_out_dim is not None else hidden_luts[1]
+        self.classifier = nn.Linear(classifier_in_dim, num_classes, bias=False)
+        self.register_buffer("keep_idx", torch.empty(0, dtype=torch.long))
+
+        '''for i, n_lut in enumerate(hidden_luts):
             k_i = int(lut_input_size_list[i])
 
             # layer0: input is bitplane (0/1) so binarize_input=True is OK
             # later: your LUT output is real-valued -> binarize_input=False
-            binarize_input = True if i == 0 else False
+            #binarize_input = True if i == 0 else False
 
             if i == 0:
                 # NOTE: conn0 must be built using k_i (not the global lut_input_size)
@@ -81,8 +232,21 @@ class MultiLayerWNN(nn.Module):
                     sobel_global_frac=0.24,
                 ).to(torch.long).cpu()
                 conn_idx = conn0
+                learnable_conn = None
+                binarize_input = True
             else:
                 conn_idx = None  # later layers random wiring
+                binarize_input = False
+
+                learnable_conn = LearnableConnTopK(
+                    num_luts=n_lut,
+                    in_bits=prev_bits,   # layer1 input dim = layer0 num_luts
+                    k=k_i,
+                    M=64,
+                    seed=42,
+                    use_gumbel=False,    # 先關掉，穩定後再試
+                    gumbel_tau=1.0,
+                )
 
             layer = WNNLUTLayer(
                 in_bits=prev_bits,
@@ -92,10 +256,12 @@ class MultiLayerWNN(nn.Module):
                 mapping=None,
                 binarize_input=binarize_input,
                 dropout_p=drop_ps[i],
-                init_std=0.05,
+                init_std=init_std_list[i],
                 # 你有跑 adaptive threshold，但目前 forward 沒用到它；
                 # 先保持預設不影響現有結果
+                learnable_conn=learnable_conn,  # ✅ 新增
             )
+
             layers.append(layer)
 
             if i == 0:
@@ -110,6 +276,9 @@ class MultiLayerWNN(nn.Module):
             self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
             # for hidden pruning
             self.register_buffer("keep_idx", torch.empty(0, dtype=torch.long))
+
+            for i, layer in enumerate(self.layers):
+                print(f"layer{i}: k={layer.lut_input_size}, in_bits={layer.in_bits}, num_luts={layer.num_luts}")'''
 
     # helper
     def enable_exit1(self, K: int, num_classes: int, bias: bool = True, exit_tau: float = 1.0, device=None):

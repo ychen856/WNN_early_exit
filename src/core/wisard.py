@@ -1814,3 +1814,175 @@ def build_conn0_hybrid_from_buckets(
         int(conn.min().item()), int(conn.max().item()), total_bits
     )
     return conn.to(device)
+
+    import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LearnableConnTopK(nn.Module):
+    """
+    Learnable mapping: for each LUT, choose k indices from a candidate pool of size M.
+
+    - cand_idx: [num_luts, M] (LongTensor, fixed buffer)
+    - logits:  [num_luts, M] (trainable)
+    - forward returns selected conn_idx: [num_luts, k] (LongTensor)
+
+    Train: straight-through top-k with softmax weights (or optional gumbel)
+    Eval : deterministic top-k by logits
+    """
+    def __init__(
+        self,
+        num_luts: int,
+        in_bits: int,
+        k: int,
+        M: int = 64,
+        seed: int = 42,
+        init_scale: float = 0.01,
+        use_gumbel: bool = False,
+        gumbel_tau: float = 1.0,
+        device: str = "cpu",
+    ):
+        super().__init__()
+        assert M >= k, "candidate pool M must be >= k"
+        self.num_luts = num_luts
+        self.in_bits = in_bits
+        self.k = k
+        self.M = M
+        self.use_gumbel = use_gumbel
+        self.gumbel_tau = gumbel_tau
+        self.entropy_loss = None
+
+        # fixed candidate pool per LUT
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        cand = torch.randint(0, in_bits, (num_luts, M), generator=g, dtype=torch.long)
+        self.register_buffer("cand_idx", cand)
+
+        # trainable logits over candidates
+        self.logits = nn.Parameter(torch.zeros(num_luts, M).normal_(0.0, init_scale))
+
+    @torch.no_grad()
+    def _topk_hard(self):
+        # [num_luts, k]
+        return torch.topk(self.logits, k=self.k, dim=1).indices
+
+    def forward(self):
+        if not self.training:
+            sel = self._topk_hard()
+            self.entropy_loss = None
+            return self.cand_idx.gather(1, sel)
+
+        if self.use_gumbel:
+            w = F.gumbel_softmax(self.logits, tau=self.gumbel_tau, hard=False, dim=1)  # [L,M]
+        else:
+            w = F.softmax(self.logits, dim=1)  # [L,M]
+
+        # ---- entropy (encourage exploration / avoid collapse too early) ----
+        eps = 1e-12
+        ent = -(w * (w + eps).log()).sum(dim=1).mean()   # scalar
+        # 我們想「maximize entropy」，所以 training loss 裡要減掉它
+        self.entropy_loss = ent
+
+        topk = torch.topk(w, k=self.k, dim=1).indices  # [L,k]
+        return self.cand_idx.gather(1, topk)
+
+def bitprobs_to_addr_probs(p_bits):  # p_bits: [B, L, k] in (0,1)
+    # returns P: [B, L, 2^k]
+    B, L, k = p_bits.shape
+    P = p_bits.new_ones(B, L, 1)
+    for j in range(k):
+        pj = p_bits[:, :, j:j+1]  # [B,L,1]
+        P = torch.cat([P * (1 - pj), P * pj], dim=-1)  # doubles last dim
+    return P  # [B,L,2^k]
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LearnableConnSlots(nn.Module):
+    def __init__(self, num_luts, in_bits, k, M=64, seed=42, use_gumbel=False, gumbel_tau=1.0):
+        super().__init__()
+        self.num_luts = num_luts
+        self.in_bits = in_bits
+        self.k = k
+        self.M = M
+        self.use_gumbel = use_gumbel
+        self.gumbel_tau = float(gumbel_tau)
+        self._cached_w = None
+        self.conn_temp = 1.0
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        cand = torch.randint(0, in_bits, (num_luts, M), generator=g)
+        self.register_buffer("cand_idx", cand.long())  # [L,M]
+
+        self.logits = nn.Parameter(torch.zeros(num_luts, k, M))
+
+    def _weights(self):
+        logits = self.logits / self.conn_temp
+        if self.use_gumbel:
+            return F.gumbel_softmax(self.logits, tau=self.gumbel_tau, hard=False, dim=-1)
+        else:
+            return F.softmax(self.logits, dim=-1)
+
+    def forward(self):
+        if self.training:
+            self._cached_w = None              # ✅ 每次 forward 清掉，避免 stale cache
+            w = self._weights()
+            self._cached_w = w
+            return w
+        else:
+            sel = torch.argmax(self.logits, dim=-1)      # [L,k]
+            return self.cand_idx.gather(1, sel)          # [L,k]
+
+    def get_cached_w(self):
+        assert self.training, "regularizers should be called in training only"
+        if self._cached_w is None:
+            self._cached_w = self._weights()
+        return self._cached_w
+
+    def entropy_loss(self, target="high"):
+        w = self.get_cached_w()
+        ent = -(w * (w.clamp_min(1e-12).log())).sum(dim=-1).mean()
+        return -ent if target == "high" else ent
+
+    def diversity_loss(self):
+        w = self.get_cached_w()
+        p = w.mean(dim=1)  # [L,M]
+        p = p / (p.sum(dim=-1, keepdim=True) + 1e-12)
+        p_norm = p / (p.norm(dim=-1, keepdim=True) + 1e-12)
+        sim = p_norm @ p_norm.t()
+        L = sim.size(0)
+        return (sim.sum() - sim.diag().sum()) / (L * (L - 1) + 1e-12)
+        
+def bitprobs_to_addr_probs(p_bits: torch.Tensor) -> torch.Tensor:
+    """
+    p_bits: [B, L, k] in (0,1)
+    return: [B, L, 2^k] probability of each address (LSB-first expansion)
+    """
+    B, L, k = p_bits.shape
+    P = p_bits.new_ones(B, L, 1)
+    for j in range(k):
+        pj = p_bits[:, :, j:j+1]  # [B,L,1]
+        P = torch.cat([P * (1 - pj), P * pj], dim=-1)
+    return P
+
+@torch.no_grad()
+def hard_unique_stats(lc):
+    # sel: [L,k] in [0,M)
+    sel = torch.argmax(lc.logits, dim=-1)
+
+    # (A) 在 candidate slot index space 的 unique 數
+    uniq_slot = sel.unique().numel()
+
+    # (B) 在實際 bit index space 的 unique 數（更重要）
+    sel_idx = lc.cand_idx.gather(1, sel)   # [L,k]
+    uniq_bit = sel_idx.unique().numel()
+
+    return uniq_slot, uniq_bit

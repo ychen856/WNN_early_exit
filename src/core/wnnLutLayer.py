@@ -1,16 +1,68 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 class WNNLUTLayer(nn.Module):
     """
-    Unified WNN LUT layer that supports both:
-
-    - mapping:  external bit-to-LUT wiring (list/np/tensor, shape [num_luts, lut_input_size])
-    - conn_idx: explicit connection indices (tensor, shape [num_luts, lut_input_size])
-
-    Internally, everything is stored as a registered buffer `conn_idx`
-    so that pruning / export code can always rely on `layer.conn_idx`.
+    Weighted Neural Network LUT Layer with Optional DWB (Differentiable Weightless Block) Support.
+    
+    Standard Mode (encoded_values_out_dim=None):
+    ============================================
+    Performs lookup table based computation:
+    1. Extract k input bits from in_bits based on conn_idx
+    2. Form address via binary representation
+    3. Lookup and retrieve value from LUT table
+    4. Output binary-like values (passed through sigmoid/tanh)
+    
+    DWB Mode (encoded_values_out_dim > 0):
+    =======================================
+    Extends standard mode with learnable encoded values:
+    1. LUT lookups produce binary outputs (as before)
+    2. Apply conditional summation: binary_out × encoded_values
+    3. Output: real-valued features instead of binary
+    
+    Mechanism:
+        binary_out = (lut_output > 0).float()           # [B, num_luts]
+        output = (binary_out.unsqueeze(-1) × encoded_values).sum(dim=(-1))  # [B, encoded_dim]
+    
+    Benefits:
+    - No multiplication overhead in binary part
+    - Learned feature representations in encoded_values
+    - Smooth gradient flow for end-to-end training
+    - Energy-efficient: addition-only in hardware
+    - Matches transformer MLP replacement in QuWeiT
+    
+    Parameters:
+    -----------
+    in_bits: int
+        Number of input bits (e.g., 2048 for CIFAR encoded)
+    num_luts: int
+        Number of lookup tables (e.g., 2000)
+    lut_input_size: int
+        Input size per LUT (e.g., 9 bits per LUT) - determines LUT table size as 2^lut_input_size
+    mapping/conn_idx: Optional
+        Bit-to-LUT wiring. If neither provided, uses random wiring.
+    binarize_input: bool
+        Whether to binarize input (0.5 threshold) before LUT lookup
+    encoded_values_out_dim: Optional[int]
+        **DWB Feature**: Enable conditional summation with this output dimension
+        - None: Standard mode, output [B, num_luts]
+        - int > 0: DWB mode, output [B, encoded_values_out_dim]
+        
+        When enabled, encoded_values shape = [num_luts, encoded_values_out_dim]
+    
+    Example:
+    --------
+    # Standard LUT layer
+    layer = WNNLUTLayer(in_bits=2048, num_luts=2000, lut_input_size=9)
+    x = torch.randn(32, 2048)
+    output = layer(x)  # [32, 2000]
+    
+    # DWB-enabled layer
+    layer_dwb = WNNLUTLayer(in_bits=2048, num_luts=2000, lut_input_size=9, 
+                            encoded_values_out_dim=8)
+    output_dwb = layer_dwb(x)  # [32, 8] - low-dimensional encoded features!
     """
 
     def __init__(
@@ -29,6 +81,9 @@ class WNNLUTLayer(nn.Module):
         thr_init: float = 0.5,        # init threshold
         thr_mode: str = "mean",       # "mean" or "median"
         thr_warmup_steps: int = 0,    # 先 0，之後需要可加 warmup
+
+        learnable_conn: nn.Module = None,
+        encoded_values_out_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -43,6 +98,8 @@ class WNNLUTLayer(nn.Module):
         self.thr_momentum = float(thr_momentum)
         self.thr_mode = str(thr_mode)
         self.thr_warmup_steps = int(thr_warmup_steps)
+
+        self.learnable_conn = learnable_conn
 
         # [1, in_bits] so broadcast works
         self.register_buffer("running_thr", torch.full((1, in_bits), float(thr_init)))
@@ -93,6 +150,15 @@ class WNNLUTLayer(nn.Module):
         table = table.normal_(mean=0.0, std=init_std)
         self.table = nn.Parameter(table)
 
+        # -----------------------------
+        # 3) Initialize encoded values for DWB
+        # -----------------------------
+        if encoded_values_out_dim is not None:
+            encoded_values = torch.randn(num_luts, encoded_values_out_dim) * init_std
+            self.encoded_values = nn.Parameter(encoded_values)
+        else:
+            self.encoded_values = None
+
 
     def forward_idk(self, x_bits):
         B = x_bits.size(0)
@@ -131,15 +197,28 @@ class WNNLUTLayer(nn.Module):
         device = x_bits.device
 
         # Extract k bits for each LUT
-        bits = x_bits[:, self.conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
+        #bits = x_bits[:, self.conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
+
+
+        # decide conn_idx (fixed or learned)
+        if self.learnable_conn is not None:
+            conn_idx = self.learnable_conn()          # [num_luts, k]
+        else:
+            conn_idx = self.conn_idx                  # [num_luts, k]
+
+        bits = x_bits[:, conn_idx.view(-1)].view(B, self.num_luts, self.lut_input_size)
+
 
 
         if self.binarize_input:
             bits = (bits > 0.5).to(torch.long)
         else:
-            mu = bits.mean(dim=0, keepdim=True)
-            sigma = bits.std(dim=0, keepdim=True) + 1e-6
-            bits = ((bits - mu) / sigma > 0).long()
+            thr = bits.median(dim=0, keepdim=True).values
+            bits = (bits > thr).long()
+            '''mu = bits.mean(dim=0, keepdim=True)
+            #sigma = bits.std(dim=0, keepdim=True) + 1e-6
+            sigma = bits.std(dim=0, keepdim=True).clamp_min(1e-3)
+            bits = ((bits - mu) / sigma > 0).long()'''
             #bits = (bits > 0.0).to(torch.long)
 
         #bits = (bits > 0.5).to(torch.long)
@@ -171,7 +250,11 @@ class WNNLUTLayer(nn.Module):
             '''out_sign = out.sign()
             out = out + (out_sign - out).detach()'''
         #print(f'out mean: {out.mean().item():.4f}, std: {out.std().item():.4f}, min: {out.min().item()}, max: {out.max().item()}')
-        return out
+        if self.encoded_values is not None:
+            binary_out = (out > 0).float()
+            return (binary_out.unsqueeze(-1) * self.encoded_values).sum(dim=1)
+        else:
+            return out
     
 
 
