@@ -47,7 +47,7 @@ class TrainConfig:
     num_classes: int = 10
     epochs: int = 300
     batch_size: int = 128
-    num_workers: int = 8
+    num_workers: int = 0  # Default to 0 for container safety; Kubernetes + SHM volume needed for >0
     pin_memory: bool = True
 
     # Model: chosen to match the paper's stated D=192 and hidden dim=768 (4xD)
@@ -373,11 +373,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--output-dir", type=str, default="./outputs/ivitt_backbone")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=128)
-    
-    # Detect container environment for num_workers default
-    default_workers = 0 if (os.path.exists('/.dockerenv') or 'KUBERNETES_SERVICE_HOST' in os.environ) else 8
-    parser.add_argument("--num-workers", type=int, default=default_workers,
-                        help=f"Number of data loading workers (default: {default_workers} for container safety)")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="Number of data loading workers (default: 0). For Kubernetes, requires SHM volume mount. See pod spec docs.")
     
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
@@ -585,16 +582,53 @@ def main():
     cfg = parse_args()
     set_seed(cfg.seed)
     
-    # Warn about container SHM issues if not mitigated
-    in_container = os.path.exists('/.dockerenv') or 'KUBERNETES_SERVICE_HOST' in os.environ
-    if in_container and cfg.num_workers > 0:
+    # Detect environment and check SHM availability
+    in_docker = os.path.exists('/.dockerenv')
+    in_k8s = 'KUBERNETES_SERVICE_HOST' in os.environ
+    shm_available = os.path.exists('/dev/shm') and os.access('/dev/shm', os.W_OK)
+    shm_size = "unknown"
+    if os.path.exists('/dev/shm'):
+        try:
+            import statvfs
+            stat = os.statvfs('/dev/shm')
+            shm_size = f"{stat.f_bavail * stat.f_frsize / (1024**3):.1f}GB"
+        except:
+            pass
+    
+    print("=" * 70)
+    print("[ENVIRONMENT DETECTION]")
+    print(f"  Docker detected: {in_docker}")
+    print(f"  Kubernetes detected: {in_k8s}")
+    print(f"  /dev/shm available: {shm_available}")
+    print(f"  /dev/shm size: {shm_size}")
+    print(f"  num_workers: {cfg.num_workers}")
+    print("=" * 70)
+    
+    # If trying to use workers in container without proper SHM
+    if (in_docker or in_k8s) and cfg.num_workers > 0 and not shm_available:
+        print("[ERROR] Cannot use num_workers > 0 without /dev/shm!")
+        print()
+        print("[SOLUTION] Update your Kubernetes pod spec to include:")
+        print()
+        print("  containers:")
+        print("  - name: vol-container")
+        print("    volumeMounts:")
+        print("    - mountPath: /dev/shm")
+        print("      name: shm")
+        print()
+        print("  volumes:")
+        print("  - name: shm")
+        print("    emptyDir:")
+        print("      medium: Memory")
+        print("      sizeLimit: 8Gi")
+        print()
+        print("[TEMPORARY FIX] Run with --num-workers 0")
         print("=" * 70)
-        print("[WARNING] Running in containerized environment with num_workers > 0")
-        print("[WARNING] This may cause 'unable to allocate shared memory' errors")
-        print("[WARNING] Mitigation options:")
-        print(f"           1. Use --num-workers 0 (current: {cfg.num_workers})")
-        print("           2. Increase container SHM: docker run --shm-size=4gb ...")
-        print("           3. For Kubernetes, set: emptyDir.sizeLimit in pod spec")
+        raise RuntimeError("SHM not available for multi-worker DataLoader. See configuration above.")
+    
+    if (in_docker or in_k8s) and cfg.num_workers > 0:
+        print(f"[INFO] Container mode with {cfg.num_workers} workers")
+        print(f"[INFO] /dev/shm available: {shm_size}")
         print("=" * 70)
     
     print(cfg)
