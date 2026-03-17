@@ -520,9 +520,11 @@ if __name__ == "__main__":
             exp_layers = 1*r0 + 2*r1 + 3*rF
             compute_ratio = exp_layers / 3.0
 
-            print(thr0, thr1,
+            '''print(thr0, thr1,
                 out["overall_acc"],
                 out["exit_rates"], out["final_rate"],
                 "E_layers", round(exp_layers, 4),
-                "compute", round(compute_ratio, 4))
+                "compute", round(compute_ratio, 4))'''
+
+            print(thr0, thr1, out)
 

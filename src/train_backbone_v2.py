@@ -90,7 +90,7 @@ def train_model(
         optimizer, mode="max", factor=0.5, patience=3, threshold=1e-3, verbose=True
     )'''
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, threshold=5e-4, verbose=True
+        optimizer, mode="max", factor=0.5, patience=5, threshold=5e-4#, verbose=True
     )
 
     best_state = None
