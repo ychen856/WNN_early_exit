@@ -1,6 +1,13 @@
+# Quasi-Weightless Transformers (QuWeiT) Training - Enhanced Version
+# Combines QuWeiT methodology with robust training infrastructure
+# Paper: "Shrinking the Giant: Quasi-Weightless Transformers for Low Energy Inference"
+# arXiv:2411.01818v1
+
 import argparse
+import copy
 import json
 import math
+import os
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -14,31 +21,31 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+from src.dataio.data import set_seed
+
 try:
     from timm.data import Mixup, create_transform
     from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
     from timm.optim import create_optimizer_v2
-    from timm.scheduler import create_scheduler_v2
 except ImportError as exc:
-    raise ImportError("This script requires timm. Install with: pip install timm") from exc
+    raise ImportError(
+        "This script requires timm. Install with: pip install timm"
+    ) from exc
 
 
-# ============================================================
-# Config
-# ============================================================
 @dataclass
 class TrainConfig:
-    dataset: str = "cifar10"
+    dataset: str = "cifar10"  # cifar10 | cifar100
     data_dir: str = "./data"
-    output_dir: str = "./outputs/quweit_early_exit_ready"
-
+    output_dir: str = "./outputs/quweit_backbone"
     image_size: int = 224
     num_classes: int = 10
     epochs: int = 300
     batch_size: int = 128
-    num_workers: int = 8
+    num_workers: int = 0  # Default to 0 for container safety; Kubernetes + SHM volume needed for >0
     pin_memory: bool = True
 
+    # Model: chosen to match the paper's stated D=192 and hidden dim=768 (4xD)
     patch_size: int = 16
     embed_dim: int = 192
     depth: int = 12
@@ -49,16 +56,18 @@ class TrainConfig:
     attn_drop_rate: float = 0.0
     drop_path_rate: float = 0.1
 
-    block_type: str = "dense"          # dense | weightless
+    # dense | weightless
+    block_type: str = "dense"
     thermometer_bins: int = 8
-    weightless_hidden_dim: int = 768    # 4 * 192, matches paper vision setup
-    use_fake_lut: bool = True           # training-time differentiable approximation
+    weightless_hidden_dim: int = 768
 
+    # Optional early-exit-ready training hooks
     use_exit: bool = False
     exit_layers: str = "3,6,9"
     exit_loss_weight: float = 0.3
     exit_threshold: float = 0.8
 
+    # Optimization
     optimizer: str = "adamw"
     lr: float = 5e-4
     weight_decay: float = 5e-2
@@ -67,6 +76,7 @@ class TrainConfig:
     clip_grad: float = 1.0
     smoothing: float = 0.1
 
+    # Augmentation
     color_jitter: float = 0.3
     aa: str = "rand-m9-mstd0.5-inc1"
     train_interpolation: str = "bicubic"
@@ -74,6 +84,7 @@ class TrainConfig:
     remode: str = "pixel"
     recount: int = 1
 
+    # Mixup/Cutmix
     mixup: float = 0.8
     cutmix: float = 1.0
     cutmix_minmax: Optional[Tuple[float, float]] = None
@@ -89,17 +100,9 @@ class TrainConfig:
     eval_only: bool = False
 
 
-# ============================================================
-# Utilities
-# ============================================================
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 class AverageMeter:
+    """Simple metric tracker."""
+
     def __init__(self):
         self.reset()
 
@@ -116,31 +119,16 @@ class AverageMeter:
         self.avg = self.sum / max(self.count, 1)
 
 
-@torch.no_grad()
-def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)):
-    maxk = max(topk)
-    batch_size = target.size(0)
-    _, pred = output.topk(maxk, 1, True, True)
-    pred = pred.t()
-    correct = pred.eq(target.reshape(1, -1).expand_as(pred))
-    res = []
-    for k in topk:
-        correct_k = correct[:k].reshape(-1).float().sum(0)
-        res.append(correct_k.mul_(100.0 / batch_size))
-    return res
-
-
-# ============================================================
-# Data
-# ============================================================
 class ResizeWithCIFARStats:
+    """Validation preprocessing for CIFAR resized to ViT input size."""
+
     def __init__(self, image_size: int):
         self.transform = transforms.Compose(
             [
                 transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+                transforms.Normalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2470, 0.2435, 0.2616)),
             ]
         )
 
@@ -148,65 +136,6 @@ class ResizeWithCIFARStats:
         return self.transform(img)
 
 
-
-def build_transforms(cfg: TrainConfig):
-    train_transform = create_transform(
-        input_size=cfg.image_size,
-        is_training=True,
-        color_jitter=cfg.color_jitter,
-        auto_augment=cfg.aa,
-        interpolation=cfg.train_interpolation,
-        re_prob=cfg.reprob,
-        re_mode=cfg.remode,
-        re_count=cfg.recount,
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2470, 0.2435, 0.2616),
-    )
-    val_transform = ResizeWithCIFARStats(cfg.image_size)
-    return train_transform, val_transform
-
-
-
-def build_datasets(cfg: TrainConfig):
-    train_transform, val_transform = build_transforms(cfg)
-    if cfg.dataset.lower() == "cifar10":
-        train_set = datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=train_transform)
-        val_set = datasets.CIFAR10(cfg.data_dir, train=False, download=True, transform=val_transform)
-        cfg.num_classes = 10
-    elif cfg.dataset.lower() == "cifar100":
-        train_set = datasets.CIFAR100(cfg.data_dir, train=True, download=True, transform=train_transform)
-        val_set = datasets.CIFAR100(cfg.data_dir, train=False, download=True, transform=val_transform)
-        cfg.num_classes = 100
-    else:
-        raise ValueError(f"Unsupported dataset: {cfg.dataset}")
-    return train_set, val_set
-
-
-
-def build_loaders(cfg: TrainConfig):
-    train_set, val_set = build_datasets(cfg)
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-        drop_last=False,
-    )
-    return train_loader, val_loader, cfg
-
-
-# ============================================================
-# Core modules: patch embedding / transformer pieces
-# ============================================================
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -215,7 +144,7 @@ class DropPath(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.drop_prob == 0.0 or not self.training:
             return x
-        keep_prob = 1 - self.drop_prob
+        keep_prob = 1.0 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()
@@ -280,19 +209,13 @@ class DenseMLP(nn.Module):
         return x
 
 
-# ============================================================
-# Weightless / LUT-friendly approximation
-# ============================================================
 class ThermometerEncodingSTE(nn.Module):
-    """
-    Differentiable thermometer-style encoding.
-    Output shape: [B, N, D, K]
-    """
+    """Differentiable thermometer-style encoding. Output: [B, N, D, K]"""
 
     def __init__(self, num_bins: int = 8, value_range: Tuple[float, float] = (-3.0, 3.0)):
         super().__init__()
-        self.num_bins = num_bins
         low, high = value_range
+        self.num_bins = num_bins
         levels = torch.linspace(low, high, steps=num_bins)
         self.register_buffer("levels", levels)
 
@@ -307,32 +230,19 @@ class ThermometerEncodingSTE(nn.Module):
 class FakeLUTLayer(nn.Module):
     """
     Training-time differentiable LUT approximation.
-    Each output unit sees all encoded inputs and produces a scalar.
-    This is still trainable in PyTorch, but the structure is organized so it can
-    later be replaced by a real LUT export pipeline.
+    x_enc: [B, N, D, K] -> out: [B, N, O]
     """
 
     def __init__(self, in_dim: int, out_dim: int, bins: int):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.bins = bins
         self.weight = nn.Parameter(torch.randn(out_dim, in_dim, bins) * 0.02)
         self.bias = nn.Parameter(torch.zeros(out_dim))
 
     def forward(self, x_enc: torch.Tensor) -> torch.Tensor:
-        # x_enc: [B, N, D, K]
-        # output: [B, N, out_dim]
-        out = torch.einsum("bndk,odk->bno", x_enc, self.weight)
-        return out + self.bias
+        return torch.einsum("bndk,odk->bno", x_enc, self.weight) + self.bias
 
 
 class ConditionalSummation(nn.Module):
-    """
-    Placeholder for the paper's conditional summation stage.
-    Current version uses a simple learned gating over channels.
-    """
-
     def __init__(self, dim: int):
         super().__init__()
         self.gate = nn.Parameter(torch.ones(dim))
@@ -343,17 +253,9 @@ class ConditionalSummation(nn.Module):
 
 class WeightlessBlock(nn.Module):
     """
-    Early-exit-ready, differentiable QuWeiT-style block.
-    Input/output shape is [B, N, D].
-
-    Current implementation is intentionally split into:
-      1) thermometer encoding
-      2) LUT layer 1 (D -> 4D)
-      3) LUT layer 2 (4D -> D)
-      4) conditional summation
-
-    For now, layer 2 re-encodes the hidden activations to keep the code simple.
-    This is a practical training-time approximation, not yet the final hardware export path.
+    QuWeiT-style training-time approximation:
+      norm -> thermometer -> LUT(D->4D) -> tanh -> thermometer -> LUT(4D->D) -> conditional summation
+    Input/output shape stays [B, N, D].
     """
 
     def __init__(self, dim: int, hidden_dim: int, bins: int = 8, drop: float = 0.0):
@@ -376,9 +278,6 @@ class WeightlessBlock(nn.Module):
         return out
 
 
-# ============================================================
-# Transformer encoder block
-# ============================================================
 class EncoderBlock(nn.Module):
     def __init__(self, cfg: TrainConfig, drop_path: float):
         super().__init__()
@@ -415,9 +314,6 @@ class EncoderBlock(nn.Module):
         return x
 
 
-# ============================================================
-# Exit heads and backbone
-# ============================================================
 class ExitHead(nn.Module):
     def __init__(self, dim: int, num_classes: int):
         super().__init__()
@@ -425,8 +321,7 @@ class ExitHead(nn.Module):
         self.fc = nn.Linear(dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cls = x[:, 0]
-        cls = self.norm(cls)
+        cls = self.norm(x[:, 0])
         return self.fc(cls)
 
 
@@ -452,9 +347,8 @@ class QuWeiTViT(nn.Module):
         self.head = nn.Linear(cfg.embed_dim, cfg.num_classes)
 
         if cfg.use_exit:
-            exit_layers = [int(x) for x in cfg.exit_layers.split(",") if x.strip()]
-            self.exit_layers = exit_layers
-            self.exit_heads = nn.ModuleDict({str(i): ExitHead(cfg.embed_dim, cfg.num_classes) for i in exit_layers})
+            self.exit_layers = [int(x) for x in cfg.exit_layers.split(",") if x.strip()]
+            self.exit_heads = nn.ModuleDict({str(i): ExitHead(cfg.embed_dim, cfg.num_classes) for i in self.exit_layers})
         else:
             self.exit_layers = []
             self.exit_heads = nn.ModuleDict()
@@ -544,9 +438,96 @@ class QuWeiTViT(nn.Module):
         }
 
 
-# ============================================================
-# Loss / mixup / checkpoint
-# ============================================================
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    num_epochs: int,
+    steps_per_epoch: int,
+    cfg: TrainConfig,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine annealing scheduler with warmup."""
+    warmup_steps = cfg.warmup_epochs * steps_per_epoch
+    total_steps = num_epochs * steps_per_epoch
+    min_lr_ratio = cfg.min_lr / cfg.lr
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return min_lr_ratio + (1.0 - min_lr_ratio) * float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def save_checkpoint(
+    output_dir: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
+    scaler: Optional[torch.cuda.amp.GradScaler],
+    epoch: int,
+    best_acc: float,
+    cfg: TrainConfig,
+    is_best: bool = False,
+):
+    """Save checkpoint."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler else None,
+        "scaler_state": scaler.state_dict() if scaler else None,
+        "best_acc": best_acc,
+        "config": asdict(cfg),
+    }
+
+    torch.save(ckpt, output_dir / "last.pth")
+    if is_best:
+        torch.save(ckpt, output_dir / "best.pth")
+
+    if (epoch + 1) % cfg.save_freq == 0:
+        torch.save(ckpt, output_dir / f"epoch_{epoch+1:03d}.pth")
+
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+):
+    """Load checkpoint."""
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model_state"])
+
+    start_epoch = ckpt.get("epoch", 0) + 1
+    best_acc = ckpt.get("best_acc", 0.0)
+
+    if optimizer is not None and "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if scheduler is not None and ckpt.get("scheduler_state") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+    if scaler is not None and ckpt.get("scaler_state") is not None:
+        scaler.load_state_dict(ckpt["scaler_state"])
+
+    return start_epoch, best_acc
+
+
+def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)):
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
 def build_mixup_fn(cfg: TrainConfig):
     active = cfg.mixup > 0 or cfg.cutmix > 0.0 or cfg.cutmix_minmax is not None
     if not active:
@@ -563,33 +544,71 @@ def build_mixup_fn(cfg: TrainConfig):
     )
 
 
-
-def save_checkpoint(state: Dict, is_best: bool, output_dir: Path, filename: str = "last.pth"):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = output_dir / filename
-    torch.save(state, ckpt_path)
-    if is_best:
-        torch.save(state, output_dir / "best.pth")
-
-
-
-def load_checkpoint(path: str, model: nn.Module, optimizer=None, scheduler=None, scaler=None):
-    checkpoint = torch.load(path, map_location="cpu")
-    model.load_state_dict(checkpoint["model"])
-    start_epoch = checkpoint.get("epoch", 0) + 1
-    best_acc = checkpoint.get("best_acc", 0.0)
-    if optimizer is not None and "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-    if scheduler is not None and checkpoint.get("scheduler") is not None:
-        scheduler.load_state_dict(checkpoint["scheduler"])
-    if scaler is not None and checkpoint.get("scaler") is not None:
-        scaler.load_state_dict(checkpoint["scaler"])
-    return start_epoch, best_acc
+def build_transforms(cfg: TrainConfig):
+    train_transform = create_transform(
+        input_size=cfg.image_size,
+        is_training=True,
+        color_jitter=cfg.color_jitter,
+        auto_augment=cfg.aa,
+        interpolation=cfg.train_interpolation,
+        re_prob=cfg.reprob,
+        re_mode=cfg.remode,
+        re_count=cfg.recount,
+        mean=(0.4914, 0.4822, 0.4465),
+        std=(0.2470, 0.2435, 0.2616),
+    )
+    val_transform = ResizeWithCIFARStats(cfg.image_size)
+    return train_transform, val_transform
 
 
-# ============================================================
-# Train / eval
-# ============================================================
+def build_datasets(cfg: TrainConfig):
+    train_transform, val_transform = build_transforms(cfg)
+
+    if cfg.dataset.lower() == "cifar10":
+        train_set = datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=train_transform)
+        val_set = datasets.CIFAR10(cfg.data_dir, train=False, download=True, transform=val_transform)
+        cfg.num_classes = 10
+    elif cfg.dataset.lower() == "cifar100":
+        train_set = datasets.CIFAR100(cfg.data_dir, train=True, download=True, transform=train_transform)
+        val_set = datasets.CIFAR100(cfg.data_dir, train=False, download=True, transform=val_transform)
+        cfg.num_classes = 100
+    else:
+        raise ValueError(f"Unsupported dataset: {cfg.dataset}")
+
+    return train_set, val_set
+
+
+def build_loaders(cfg: TrainConfig):
+    train_set, val_set = build_datasets(cfg)
+
+    def create_loader(dataset, is_train=True, workers=0):
+        try:
+            return DataLoader(
+                dataset,
+                batch_size=cfg.batch_size,
+                shuffle=is_train,
+                num_workers=workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=is_train,
+            )
+        except RuntimeError as e:
+            if workers > 0 and ("shared memory" in str(e).lower() or "shm" in str(e).lower()):
+                print(f"[WARNING] SHM error with num_workers={workers}. Retrying with num_workers=0...")
+                return DataLoader(
+                    dataset,
+                    batch_size=cfg.batch_size,
+                    shuffle=is_train,
+                    num_workers=0,
+                    pin_memory=cfg.pin_memory,
+                    drop_last=is_train,
+                )
+            raise
+
+    train_loader = create_loader(train_set, is_train=True, workers=cfg.num_workers)
+    val_loader = create_loader(val_set, is_train=False, workers=cfg.num_workers)
+    return train_loader, val_loader, cfg
+
+
 def compute_losses(outputs, targets, train_criterion, ce_criterion, cfg: TrainConfig):
     main_logits = outputs["logits"] if isinstance(outputs, dict) else outputs
     main_loss = train_criterion(main_logits, targets)
@@ -600,22 +619,71 @@ def compute_losses(outputs, targets, train_criterion, ce_criterion, cfg: TrainCo
             for _, exit_logits in outputs["exit_logits"].items():
                 aux_loss = aux_loss + ce_criterion(exit_logits, targets)
         else:
-            # mixup/cutmix soft labels: auxiliary loss uses the same training criterion
             for _, exit_logits in outputs["exit_logits"].items():
                 aux_loss = aux_loss + train_criterion(exit_logits, targets)
 
     total_loss = main_loss + cfg.exit_loss_weight * aux_loss
-    return total_loss, main_loss, aux_loss
+    return total_loss
 
 
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, cfg: Optional[TrainConfig] = None):
+    loss_meter = AverageMeter()
+    acc1_meter = AverageMeter()
+    acc5_meter = AverageMeter()
 
-def train_one_epoch(model, loader, train_criterion, ce_criterion, optimizer, device, epoch, scaler, mixup_fn, lr_scheduler, cfg: TrainConfig):
+    exit_stats = {}
+    total_samples = 0
+
+    model.eval()
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        outputs = model(images, return_intermediate=bool(cfg and cfg.use_exit))
+        logits = outputs["logits"] if isinstance(outputs, dict) else outputs
+        loss = criterion(logits, targets)
+        acc1, acc5 = accuracy(logits, targets, topk=(1, 5))
+
+        loss_meter.update(loss.item(), images.size(0))
+        acc1_meter.update(acc1.item(), images.size(0))
+        acc5_meter.update(acc5.item(), images.size(0))
+
+        if cfg is not None and cfg.use_exit:
+            ee = model.forward_early_exit(images)
+            exit_layer = int(ee["exit_layer"])
+            exit_stats[exit_layer] = exit_stats.get(exit_layer, 0) + images.size(0)
+            total_samples += images.size(0)
+
+    metrics = {
+        "loss": loss_meter.avg,
+        "acc1": acc1_meter.avg,
+        "acc5": acc5_meter.avg,
+    }
+    if total_samples > 0:
+        metrics["exit_ratio"] = {k: v / total_samples for k, v in sorted(exit_stats.items())}
+    return metrics
+
+
+def train_one_epoch(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+    scaler,
+    mixup_fn,
+    lr_scheduler,
+    cfg: TrainConfig,
+):
     model.train()
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
-    start = time.time()
 
-    for step, (images, targets) in enumerate(loader):
+    ce_criterion = nn.CrossEntropyLoss()
+    start = time.time()
+    for step, (images, targets) in enumerate(train_loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         hard_targets = targets.clone()
@@ -627,7 +695,7 @@ def train_one_epoch(model, loader, train_criterion, ce_criterion, optimizer, dev
 
         with torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda"):
             outputs = model(images, return_intermediate=cfg.use_exit)
-            loss, _, _ = compute_losses(outputs, targets, train_criterion, ce_criterion, cfg)
+            loss = compute_losses(outputs, targets, criterion, ce_criterion, cfg)
 
         scaler.scale(loss).backward()
         if cfg.clip_grad is not None and cfg.clip_grad > 0:
@@ -637,94 +705,62 @@ def train_one_epoch(model, loader, train_criterion, ce_criterion, optimizer, dev
         scaler.update()
 
         if lr_scheduler is not None:
-            lr_scheduler.step_update(num_updates=epoch * len(loader) + step)
+            current_step = epoch * len(train_loader) + step
+            lr_lambda_fn = lr_scheduler.lr_lambdas[0]
+            scale = lr_lambda_fn(current_step)
+            for param_group in optimizer.param_groups:
+                base_lr = param_group.get("initial_lr", cfg.lr)
+                param_group["lr"] = base_lr * scale
 
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs
         acc1 = accuracy(logits, hard_targets, topk=(1,))[0]
         loss_meter.update(loss.item(), images.size(0))
         acc_meter.update(acc1.item(), images.size(0))
 
-        if step % 50 == 0:
+        if step % 100 == 0:
             current_lr = optimizer.param_groups[0]["lr"]
             print(
-                f"Epoch [{epoch:3d}] Step [{step:4d}/{len(loader):4d}] "
-                f"Loss {loss_meter.avg:.4f} Acc {acc_meter.avg:.2f}% LR {current_lr:.2e}"
+                f"Epoch [{epoch:03d}] Step [{step:04d}/{len(train_loader):04d}] "
+                f"Loss {loss_meter.avg:.4f} Acc {acc_meter.avg:.2f}% LR {current_lr:.6e}"
             )
 
     elapsed = time.time() - start
     return {"loss": loss_meter.avg, "acc1": acc_meter.avg, "epoch_time_sec": elapsed}
 
 
-@torch.no_grad()
-def evaluate(model, loader, criterion, device, cfg: TrainConfig):
-    loss_meter = AverageMeter()
-    acc1_meter = AverageMeter()
-    acc5_meter = AverageMeter()
-
-    exit_stats = {int(k): 0 for k in cfg.exit_layers.split(",") if k.strip()} if cfg.use_exit else {}
-    total_samples = 0
-
-    model.eval()
-    for images, targets in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-
-        outputs = model(images, return_intermediate=cfg.use_exit)
-        logits = outputs["logits"] if isinstance(outputs, dict) else outputs
-        loss = criterion(logits, targets)
-        acc1, acc5 = accuracy(logits, targets, topk=(1, 5))
-
-        loss_meter.update(loss.item(), images.size(0))
-        acc1_meter.update(acc1.item(), images.size(0))
-        acc5_meter.update(acc5.item(), images.size(0))
-
-        if cfg.use_exit:
-            ee = model.forward_early_exit(images)
-            exit_stats[int(ee["exit_layer"])] = exit_stats.get(int(ee["exit_layer"]), 0) + images.size(0)
-            total_samples += images.size(0)
-
-    metrics = {
-        "loss": loss_meter.avg,
-        "acc1": acc1_meter.avg,
-        "acc5": acc5_meter.avg,
-    }
-    if cfg.use_exit and total_samples > 0:
-        metrics["exit_ratio"] = {k: v / total_samples for k, v in sorted(exit_stats.items())}
-    return metrics
-
-
-# ============================================================
-# Build / parse
-# ============================================================
-def build_model(cfg: TrainConfig) -> nn.Module:
-    return QuWeiTViT(cfg)
-
-
-
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="QuWeiT-style backbone / early-exit-ready trainer")
+    parser = argparse.ArgumentParser(description="Train QuWeiT / I-ViT-T style backbone")
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
     parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--output-dir", type=str, default="./outputs/quweit_early_exit_ready")
+    parser.add_argument("--output-dir", type=str, default="./outputs/quweit_backbone")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="Number of data loading workers (default: 0). For Kubernetes, requires SHM volume mount.")
+
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--drop-path", type=float, default=0.1)
+    parser.add_argument("--mixup", type=float, default=0.8)
+    parser.add_argument("--cutmix", type=float, default=1.0)
+    parser.add_argument("--smoothing", type=float, default=0.1)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--save-freq", type=int, default=20)
+
     parser.add_argument("--block-type", type=str, default="dense", choices=["dense", "weightless"])
     parser.add_argument("--thermometer-bins", type=int, default=8)
     parser.add_argument("--weightless-hidden-dim", type=int, default=768)
+
     parser.add_argument("--use-exit", action="store_true")
     parser.add_argument("--exit-layers", type=str, default="3,6,9")
     parser.add_argument("--exit-loss-weight", type=float, default=0.3)
     parser.add_argument("--exit-threshold", type=float, default=0.8)
+
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--eval-only", action="store_true")
     args = parser.parse_args()
@@ -740,6 +776,10 @@ def parse_args() -> TrainConfig:
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
         min_lr=args.min_lr,
+        drop_path_rate=args.drop_path,
+        mixup=args.mixup,
+        cutmix=args.cutmix,
+        smoothing=args.smoothing,
         image_size=args.image_size,
         seed=args.seed,
         device=args.device,
@@ -757,12 +797,103 @@ def parse_args() -> TrainConfig:
     )
 
 
-# ============================================================
-# Main
-# ============================================================
+def build_model(cfg: TrainConfig) -> nn.Module:
+    return QuWeiTViT(cfg)
+
+
+def save_best_checkpoint_atomic(
+    path_out: str,
+    model: torch.nn.Module,
+    best_val_acc: float,
+    epoch: int,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    extra: dict = None,
+):
+    tmp_path = path_out + ".tmp"
+
+    payload = {
+        "epoch": epoch,
+        "best_val_acc": float(best_val_acc),
+        "model_state": model.state_dict(),
+    }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler_state"] = scaler.state_dict()
+    if extra is not None:
+        payload["extra"] = extra
+
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path_out)
+
+
+def save_best_fn(epoch, model, optimizer, scheduler, scaler, best_val_acc, output_path):
+    save_best_checkpoint_atomic(
+        path_out=output_path,
+        model=model,
+        best_val_acc=best_val_acc,
+        epoch=epoch,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+    )
+
+
 def main():
     cfg = parse_args()
     set_seed(cfg.seed)
+
+    in_docker = os.path.exists('/.dockerenv')
+    in_k8s = 'KUBERNETES_SERVICE_HOST' in os.environ
+    shm_available = os.path.exists('/dev/shm') and os.access('/dev/shm', os.W_OK)
+    shm_size = "unknown"
+    if os.path.exists('/dev/shm'):
+        try:
+            stat = os.statvfs('/dev/shm')
+            shm_size = f"{stat.f_bavail * stat.f_frsize / (1024**3):.1f}GB"
+        except Exception:
+            pass
+
+    print("=" * 70)
+    print("[ENVIRONMENT DETECTION]")
+    print(f"  Docker detected: {in_docker}")
+    print(f"  Kubernetes detected: {in_k8s}")
+    print(f"  /dev/shm available: {shm_available}")
+    print(f"  /dev/shm size: {shm_size}")
+    print(f"  num_workers: {cfg.num_workers}")
+    print("=" * 70)
+
+    if (in_docker or in_k8s) and cfg.num_workers > 0 and not shm_available:
+        print("[ERROR] Cannot use num_workers > 0 without /dev/shm!")
+        print()
+        print("[SOLUTION] Update your Kubernetes pod spec to include:")
+        print()
+        print("  containers:")
+        print("  - name: vol-container")
+        print("    volumeMounts:")
+        print("    - mountPath: /dev/shm")
+        print("      name: shm")
+        print()
+        print("  volumes:")
+        print("  - name: shm")
+        print("    emptyDir:")
+        print("      medium: Memory")
+        print("      sizeLimit: 8Gi")
+        print()
+        print("[TEMPORARY FIX] Run with --num-workers 0")
+        print("=" * 70)
+        raise RuntimeError("SHM not available for multi-worker DataLoader. See configuration above.")
+
+    if (in_docker or in_k8s) and cfg.num_workers > 0:
+        print(f"[INFO] Container mode with {cfg.num_workers} workers")
+        print(f"[INFO] /dev/shm available: {shm_size}")
+        print("=" * 70)
+
+    print(cfg)
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     output_dir = Path(cfg.output_dir)
@@ -778,7 +909,6 @@ def main():
         train_criterion = LabelSmoothingCrossEntropy(smoothing=cfg.smoothing)
     else:
         train_criterion = nn.CrossEntropyLoss()
-    ce_criterion = nn.CrossEntropyLoss()
     val_criterion = nn.CrossEntropyLoss()
 
     optimizer = create_optimizer_v2(
@@ -788,15 +918,15 @@ def main():
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.999),
     )
+    for param_group in optimizer.param_groups:
+        param_group.setdefault("initial_lr", param_group["lr"])
 
-    scheduler, _ = create_scheduler_v2(
+    steps_per_epoch = len(train_loader)
+    scheduler = build_scheduler(
         optimizer,
-        sched="cosine",
         num_epochs=cfg.epochs,
-        min_lr=cfg.min_lr,
-        warmup_lr=1e-6,
-        warmup_epochs=cfg.warmup_epochs,
-        updates_per_epoch=len(train_loader),
+        steps_per_epoch=steps_per_epoch,
+        cfg=cfg,
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
@@ -812,18 +942,26 @@ def main():
 
     if cfg.eval_only:
         metrics = evaluate(model, val_loader, val_criterion, device, cfg)
-        print(metrics)
+        print(
+            f"[Eval] loss={metrics['loss']:.4f} acc1={metrics['acc1']:.2f} acc5={metrics['acc5']:.2f}"
+        )
+        if "exit_ratio" in metrics:
+            print(f"[Eval] exit_ratio={metrics['exit_ratio']}")
         return
 
-    print("Start training...")
+    print("Start training backbone...")
     print(json.dumps(asdict(cfg), indent=2))
+
+    best_state = None
+    best_val_acc = -1.0
+    best_epoch = -1
+    no_improve = 0
 
     for epoch in range(start_epoch, cfg.epochs):
         train_stats = train_one_epoch(
             model=model,
-            loader=train_loader,
-            train_criterion=train_criterion,
-            ce_criterion=ce_criterion,
+            train_loader=train_loader,
+            criterion=train_criterion,
             optimizer=optimizer,
             device=device,
             epoch=epoch,
@@ -838,28 +976,51 @@ def main():
         best_acc = max(best_acc, val_stats["acc1"])
 
         print(
-            f"Epoch {epoch:03d} | train_loss={train_stats['loss']:.4f} | "
-            f"train_acc1={train_stats['acc1']:.2f} | val_loss={val_stats['loss']:.4f} | "
-            f"val_acc1={val_stats['acc1']:.2f} | val_acc5={val_stats['acc5']:.2f} | "
-            f"best_acc1={best_acc:.2f} | time={train_stats['epoch_time_sec']:.1f}s"
+            f"Epoch {epoch:03d} | "
+            f"train_loss={train_stats['loss']:.4f} | "
+            f"train_acc1={train_stats['acc1']:.2f} | "
+            f"val_loss={val_stats['loss']:.4f} | "
+            f"val_acc1={val_stats['acc1']:.2f} | "
+            f"val_acc5={val_stats['acc5']:.2f} | "
+            f"best_acc1={best_acc:.2f} | "
+            f"time={train_stats['epoch_time_sec']:.1f}s"
         )
         if "exit_ratio" in val_stats:
             print(f"Exit ratio: {val_stats['exit_ratio']}")
 
-        state = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "scaler": scaler.state_dict() if scaler is not None else None,
-            "best_acc": best_acc,
-            "config": asdict(cfg),
-        }
-        save_checkpoint(state, is_best, output_dir, filename="last.pth")
-        if (epoch + 1) % cfg.save_freq == 0:
-            save_checkpoint(state, False, output_dir, filename=f"epoch_{epoch + 1:03d}.pth")
+        save_checkpoint(
+            output_dir=output_dir,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_acc=best_acc,
+            cfg=cfg,
+            is_best=is_best,
+        )
+
+        if val_stats['acc1'] > best_val_acc:
+            best_val_acc = val_stats['acc1']
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+
+            save_best_fn(
+                epoch,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                best_val_acc,
+                str(output_dir / 'wnn_quwei_CIFAR.pth')
+            )
+            print(f"[BEST] epoch={epoch:03d} val_acc={best_val_acc:.2f}%")
+        else:
+            no_improve += 1
 
     print(f"Training finished. Best top-1 accuracy: {best_acc:.2f}")
+    print(f"Best epoch: {best_epoch}")
     print(f"Checkpoints saved to: {output_dir}")
 
 
