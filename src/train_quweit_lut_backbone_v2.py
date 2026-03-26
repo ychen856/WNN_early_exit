@@ -833,7 +833,9 @@ def save_best_checkpoint_atomic(
     scaler=None,
     extra: dict = None,
 ):
-    tmp_path = path_out + ".tmp"
+    path_out = Path(path_out)
+    path_out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path_out.with_suffix(path_out.suffix + ".tmp")
 
     payload = {
         "epoch": epoch,
@@ -850,12 +852,12 @@ def save_best_checkpoint_atomic(
         payload["extra"] = extra
 
     torch.save(payload, tmp_path)
-    os.replace(tmp_path, path_out)
+    os.replace(str(tmp_path), str(path_out))
 
 
 def save_best_fn(epoch, model, optimizer, scheduler, scaler, best_val_acc, output_path):
     save_best_checkpoint_atomic(
-        path_out=output_path,
+        path_out=Path(output_path),
         model=model,
         best_val_acc=best_val_acc,
         epoch=epoch,
@@ -863,7 +865,6 @@ def save_best_fn(epoch, model, optimizer, scheduler, scaler, best_val_acc, outpu
         scheduler=scheduler,
         scaler=scaler,
     )
-
 
 def main():
     cfg = parse_args()
