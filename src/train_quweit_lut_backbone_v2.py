@@ -981,6 +981,7 @@ def main():
     no_improve = 0
 
     for epoch in range(start_epoch, cfg.epochs):
+        t0 = time.time()
         train_stats = train_one_epoch(
             model=model,
             train_loader=train_loader,
@@ -993,8 +994,9 @@ def main():
             lr_scheduler=scheduler,
             cfg=cfg,
         )
-
+        t1 = time.time()
         val_stats = evaluate(model, val_loader, val_criterion, device, cfg)
+        t2 = time.time()
         is_best = val_stats["acc1"] > best_acc
         best_acc = max(best_acc, val_stats["acc1"])
 
@@ -1022,13 +1024,15 @@ def main():
             cfg=cfg,
             is_best=is_best,
         )
+        t3 = time.time()
+        print(f"[TIMING] train={t1-t0:.1f}s eval={t2-t1:.1f}s save={t3-t2:.1f}s")
 
         if val_stats['acc1'] > best_val_acc:
             best_val_acc = val_stats['acc1']
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             no_improve = 0
-
+            t4 = time.time()
             save_best_fn(
                 epoch,
                 model,
@@ -1038,6 +1042,8 @@ def main():
                 best_val_acc,
                 str(output_dir / 'wnn_quwei_CIFAR.pth')
             )
+            t5 = time.time()
+            print(f"[TIMING] best_save={t5-t4:.1f}s")
             print(f"[BEST] epoch={epoch:03d} val_acc={best_val_acc:.2f}%")
         else:
             no_improve += 1
