@@ -505,7 +505,10 @@ def save_checkpoint(
     if is_best:
         torch.save(ckpt, output_dir / "best.pth")
 
+    print('save freq: ', cfg.save_freq)
+    print('epoch: ', epoch)
     if (epoch + 1) % cfg.save_freq == 0:
+        print('save..')
         torch.save(ckpt, output_dir / f"epoch_{epoch+1:03d}.pth")
 
 
@@ -980,6 +983,7 @@ def main():
     best_epoch = -1
     no_improve = 0
 
+    print('save freq: ', cfg.save_freq)
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
         train_stats = train_one_epoch(
@@ -1012,7 +1016,7 @@ def main():
         )
         if "exit_ratio" in val_stats:
             print(f"Exit ratio: {val_stats['exit_ratio']}")
-
+        print('saving checkpoint...')
         save_checkpoint(
             output_dir=output_dir,
             model=model,
