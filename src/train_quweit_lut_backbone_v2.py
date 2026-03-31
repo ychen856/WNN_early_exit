@@ -772,7 +772,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--save-freq", type=int, default=20)
+    parser.add_argument("--save-freq", type=int, default=3)
 
     parser.add_argument("--block-type", type=str, default="dense", choices=["dense", "weightless"])
     parser.add_argument("--thermometer-bins", type=int, default=8)
