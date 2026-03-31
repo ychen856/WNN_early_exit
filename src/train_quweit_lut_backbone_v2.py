@@ -97,7 +97,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "cuda"
     resume: str = ""
-    save_freq: int = 20
+    save_freq: int = 3
     eval_only: bool = False
 
 
