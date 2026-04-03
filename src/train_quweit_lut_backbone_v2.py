@@ -24,7 +24,7 @@ from torchvision import datasets, transforms
 from src.dataio.data import set_seed
 
 try:
-    from timm.data import Mixup, create_transform
+    from timm.data import Mixup
     from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
     from timm.optim import create_optimizer_v2
 except ImportError as exc:
@@ -86,12 +86,14 @@ class TrainConfig:
     recount: int = 1
 
     # Mixup/Cutmix
-    mixup: float = 0.8
+    mixup: float = 0.0
     cutmix: float = 1.0
     cutmix_minmax: Optional[Tuple[float, float]] = None
     mixup_prob: float = 1.0
     mixup_switch_prob: float = 0.5
     mixup_mode: str = "batch"
+    model_ema: bool = False
+    model_ema_decay: float = 0.9999
 
     amp: bool = True
     seed: int = 42
@@ -135,6 +137,33 @@ class ResizeWithCIFARStats:
 
     def __call__(self, img):
         return self.transform(img)
+
+
+class ModelEma:
+    """Lightweight EMA tracker for model weights."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.module = copy.deepcopy(model).eval()
+        self.decay = decay
+        for param in self.module.parameters():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        model_state = model.state_dict()
+        ema_state = self.module.state_dict()
+        for key, ema_value in ema_state.items():
+            model_value = model_state[key].detach()
+            if not torch.is_floating_point(ema_value):
+                ema_value.copy_(model_value)
+                continue
+            ema_value.mul_(self.decay).add_(model_value, alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.module.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.module.load_state_dict(state_dict)
 
 
 class DropPath(nn.Module):
@@ -480,6 +509,7 @@ def build_scheduler(
 def save_checkpoint(
     output_dir: Path,
     model: nn.Module,
+    model_ema: Optional[ModelEma],
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     scaler: Optional[torch.cuda.amp.GradScaler],
@@ -497,6 +527,7 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler else None,
         "scaler_state": scaler.state_dict() if scaler else None,
+        "model_ema_state": model_ema.state_dict() if model_ema else None,
         "best_acc": best_acc,
         "config": asdict(cfg),
     }
@@ -515,6 +546,7 @@ def save_checkpoint(
 def load_checkpoint(
     path: str,
     model: nn.Module,
+    model_ema: Optional[ModelEma] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
@@ -532,6 +564,8 @@ def load_checkpoint(
         scheduler.load_state_dict(ckpt["scheduler_state"])
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
+    if model_ema is not None and ckpt.get("model_ema_state") is not None:
+        model_ema.load_state_dict(ckpt["model_ema_state"])
 
     return start_epoch, best_acc
 
@@ -567,43 +601,56 @@ def build_mixup_fn(cfg: TrainConfig):
 
 
 def build_transforms(cfg: TrainConfig):
-    train_transform = create_transform(
-        input_size=cfg.image_size,
-        is_training=True,
-        color_jitter=cfg.color_jitter,
-        auto_augment=cfg.aa,
-        interpolation=cfg.train_interpolation,
-        re_prob=cfg.reprob,
-        re_mode=cfg.remode,
-        re_count=cfg.recount,
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2470, 0.2435, 0.2616),
+    mean = (0.4914, 0.4822, 0.4465)
+    std = (0.2470, 0.2435, 0.2616)
+    resize = transforms.Resize(
+        cfg.image_size,
+        interpolation=transforms.InterpolationMode.BICUBIC,
     )
-    val_transform = ResizeWithCIFARStats(cfg.image_size)
-    return train_transform, val_transform
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=9),
+            resize,
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+            transforms.RandomErasing(
+                p=0.25,
+                scale=(0.02, 0.2),
+                ratio=(0.3, 3.3),
+            ),
+        ]
+    )
+    eval_transform = ResizeWithCIFARStats(cfg.image_size)
+    clean_train_transform = ResizeWithCIFARStats(cfg.image_size)
+    return train_transform, eval_transform, clean_train_transform
 
 
 def build_datasets(cfg: TrainConfig):
-    train_transform, val_transform = build_transforms(cfg)
+    train_transform, val_transform, clean_train_transform = build_transforms(cfg)
 
     if cfg.dataset.lower() == "cifar10":
         train_set = datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=train_transform)
         val_set = datasets.CIFAR10(cfg.data_dir, train=False, download=True, transform=val_transform)
+        clean_train_set = datasets.CIFAR10(cfg.data_dir, train=True, download=True, transform=clean_train_transform)
         cfg.num_classes = 10
     elif cfg.dataset.lower() == "cifar100":
         train_set = datasets.CIFAR100(cfg.data_dir, train=True, download=True, transform=train_transform)
         val_set = datasets.CIFAR100(cfg.data_dir, train=False, download=True, transform=val_transform)
+        clean_train_set = datasets.CIFAR100(cfg.data_dir, train=True, download=True, transform=clean_train_transform)
         cfg.num_classes = 100
     else:
         raise ValueError(f"Unsupported dataset: {cfg.dataset}")
 
-    return train_set, val_set
+    return train_set, val_set, clean_train_set
 
 
 def build_loaders(cfg: TrainConfig):
-    train_set, val_set = build_datasets(cfg)
+    train_set, val_set, clean_train_set = build_datasets(cfg)
 
-    def create_loader(dataset, is_train=True, workers=0):
+    def create_loader(dataset, is_train=True, workers=0, drop_last=None):
+        loader_drop_last = is_train if drop_last is None else drop_last
         try:
             return DataLoader(
                 dataset,
@@ -611,7 +658,7 @@ def build_loaders(cfg: TrainConfig):
                 shuffle=is_train,
                 num_workers=workers,
                 pin_memory=cfg.pin_memory,
-                drop_last=is_train,
+                drop_last=loader_drop_last,
             )
         except RuntimeError as e:
             if workers > 0 and ("shared memory" in str(e).lower() or "shm" in str(e).lower()):
@@ -622,13 +669,19 @@ def build_loaders(cfg: TrainConfig):
                     shuffle=is_train,
                     num_workers=0,
                     pin_memory=cfg.pin_memory,
-                    drop_last=is_train,
+                    drop_last=loader_drop_last,
                 )
             raise
 
     train_loader = create_loader(train_set, is_train=True, workers=cfg.num_workers)
     val_loader = create_loader(val_set, is_train=False, workers=cfg.num_workers)
-    return train_loader, val_loader, cfg
+    clean_train_loader = create_loader(
+        clean_train_set,
+        is_train=False,
+        workers=cfg.num_workers,
+        drop_last=False,
+    )
+    return train_loader, val_loader, clean_train_loader, cfg
 
 
 def compute_losses(outputs, targets, train_criterion, ce_criterion, cfg: TrainConfig):
@@ -696,6 +749,7 @@ def train_one_epoch(
     epoch,
     scaler,
     mixup_fn,
+    model_ema,
     lr_scheduler,
     cfg: TrainConfig,
 ):
@@ -725,6 +779,8 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad)
         scaler.step(optimizer)
         scaler.update()
+        if model_ema is not None:
+            model_ema.update(model)
 
         if lr_scheduler is not None:
             current_step = epoch * len(train_loader) + step
@@ -765,9 +821,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--drop-path", type=float, default=0.1)
-    parser.add_argument("--mixup", type=float, default=0.8)
+    parser.add_argument("--mixup", type=float, default=0.0)
     parser.add_argument("--cutmix", type=float, default=1.0)
     parser.add_argument("--smoothing", type=float, default=0.1)
+    parser.add_argument("--model-ema", action="store_true")
+    parser.add_argument("--model-ema-decay", type=float, default=0.9999)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
@@ -804,6 +862,8 @@ def parse_args() -> TrainConfig:
         mixup=args.mixup,
         cutmix=args.cutmix,
         smoothing=args.smoothing,
+        model_ema=args.model_ema,
+        model_ema_decay=args.model_ema_decay,
         image_size=args.image_size,
         seed=args.seed,
         device=args.device,
@@ -831,6 +891,7 @@ def save_best_checkpoint_atomic(
     model: torch.nn.Module,
     best_val_acc: float,
     epoch: int,
+    model_ema: Optional[ModelEma] = None,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -844,6 +905,7 @@ def save_best_checkpoint_atomic(
         "epoch": epoch,
         "best_val_acc": float(best_val_acc),
         "model_state": model.state_dict(),
+        "model_ema_state": model_ema.state_dict() if model_ema else None,
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
@@ -858,12 +920,13 @@ def save_best_checkpoint_atomic(
     os.replace(str(tmp_path), str(path_out))
 
 
-def save_best_fn(epoch, model, optimizer, scheduler, scaler, best_val_acc, output_path):
+def save_best_fn(epoch, model, model_ema, optimizer, scheduler, scaler, best_val_acc, output_path):
     save_best_checkpoint_atomic(
         path_out=Path(output_path),
         model=model,
         best_val_acc=best_val_acc,
         epoch=epoch,
+        model_ema=model_ema,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
@@ -925,8 +988,9 @@ def main():
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader, cfg = build_loaders(cfg)
+    train_loader, val_loader, clean_train_loader, cfg = build_loaders(cfg)
     model = build_model(cfg).to(device)
+    model_ema = ModelEma(model, decay=cfg.model_ema_decay) if cfg.model_ema else None
 
     mixup_fn = build_mixup_fn(cfg)
     if mixup_fn is not None:
@@ -960,7 +1024,14 @@ def main():
     start_epoch = 0
 
     if cfg.resume:
-        start_epoch, best_acc = load_checkpoint(cfg.resume, model, optimizer, scheduler, scaler)
+        start_epoch, best_acc = load_checkpoint(
+            cfg.resume,
+            model,
+            model_ema=model_ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+        )
         print(f"Resumed from {cfg.resume}, start_epoch={start_epoch}, best_acc={best_acc:.2f}")
 
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
@@ -973,6 +1044,17 @@ def main():
         )
         if "exit_ratio" in metrics:
             print(f"[Eval] exit_ratio={metrics['exit_ratio']}")
+        clean_metrics = evaluate(model, clean_train_loader, val_criterion, device, cfg)
+        print(
+            f"[Train-Clean] loss={clean_metrics['loss']:.4f} "
+            f"acc1={clean_metrics['acc1']:.2f} acc5={clean_metrics['acc5']:.2f}"
+        )
+        if model_ema is not None:
+            ema_metrics = evaluate(model_ema.module, val_loader, val_criterion, device, cfg)
+            print(
+                f"[EMA Eval] loss={ema_metrics['loss']:.4f} "
+                f"acc1={ema_metrics['acc1']:.2f} acc5={ema_metrics['acc5']:.2f}"
+            )
         return
 
     print("Start training backbone...")
@@ -995,31 +1077,48 @@ def main():
             epoch=epoch,
             scaler=scaler,
             mixup_fn=mixup_fn,
+            model_ema=model_ema,
             lr_scheduler=scheduler,
             cfg=cfg,
         )
         t1 = time.time()
         val_stats = evaluate(model, val_loader, val_criterion, device, cfg)
+        train_clean_stats = evaluate(model, clean_train_loader, val_criterion, device, cfg)
+        ema_val_stats = None
+        if model_ema is not None:
+            ema_val_stats = evaluate(model_ema.module, val_loader, val_criterion, device, cfg)
         t2 = time.time()
-        is_best = val_stats["acc1"] > best_acc
-        best_acc = max(best_acc, val_stats["acc1"])
+        tracked_val_acc = ema_val_stats["acc1"] if ema_val_stats is not None else val_stats["acc1"]
+        is_best = tracked_val_acc > best_acc
+        best_acc = max(best_acc, tracked_val_acc)
 
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={train_stats['loss']:.4f} | "
             f"train_acc1={train_stats['acc1']:.2f} | "
+            f"train_clean_loss={train_clean_stats['loss']:.4f} | "
+            f"train_clean_acc1={train_clean_stats['acc1']:.2f} | "
+            f"train_clean_acc5={train_clean_stats['acc5']:.2f} | "
             f"val_loss={val_stats['loss']:.4f} | "
             f"val_acc1={val_stats['acc1']:.2f} | "
             f"val_acc5={val_stats['acc5']:.2f} | "
             f"best_acc1={best_acc:.2f} | "
             f"time={train_stats['epoch_time_sec']:.1f}s"
         )
+        if ema_val_stats is not None:
+            print(
+                f"EMA Epoch {epoch:03d} | "
+                f"ema_val_loss={ema_val_stats['loss']:.4f} | "
+                f"ema_val_acc1={ema_val_stats['acc1']:.2f} | "
+                f"ema_val_acc5={ema_val_stats['acc5']:.2f}"
+            )
         if "exit_ratio" in val_stats:
             print(f"Exit ratio: {val_stats['exit_ratio']}")
         print('saving checkpoint...')
         save_checkpoint(
             output_dir=output_dir,
             model=model,
+            model_ema=model_ema,
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
@@ -1031,15 +1130,17 @@ def main():
         t3 = time.time()
         print(f"[TIMING] train={t1-t0:.1f}s eval={t2-t1:.1f}s save={t3-t2:.1f}s")
 
-        if val_stats['acc1'] > best_val_acc:
-            best_val_acc = val_stats['acc1']
+        if tracked_val_acc > best_val_acc:
+            best_val_acc = tracked_val_acc
             best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
+            best_source = model_ema.module if model_ema is not None else model
+            best_state = copy.deepcopy(best_source.state_dict())
             no_improve = 0
             t4 = time.time()
             save_best_fn(
                 epoch,
                 model,
+                model_ema,
                 optimizer,
                 scheduler,
                 scaler,
