@@ -797,6 +797,7 @@ if __name__ == "__main__":
         )
         print(thr, out["exit_rate"], out["overall_acc"], out["exited_acc"], out["non_exited_acc"],
               out["margin_mean"], out["margin_p95"])
+        print_eval_profile(f"G1-v2 exit0@thr={thr}", out)
     
     print('=======================================')
     thrs0 = [0.5, 1.0, 1.5]
@@ -838,6 +839,7 @@ if __name__ == "__main__":
             m1_detail = out['margin_stats'][3]
             print(f" | m0_undecided={m0_detail['undecided_mean']:.2f} m0_undecided_p95={m0_detail['undecided_p95']:.2f} m0_taken_mean={m0_detail['taken_mean']:.2f} m0_taken_p95={m0_detail['taken_p95']:.2f}")
             print(f" | m1_undecided={m1_detail['undecided_mean']:.2f} m1_undecided_p95={m1_detail['undecided_p95']:.2f} m1_taken_mean={m1_detail['taken_mean']:.2f} m1_taken_p95={m1_detail['taken_p95']:.2f}")
+            print_eval_profile(f"G1-v2 cascade@({thr0},{thr1})", out)
 
 
 

@@ -9,7 +9,7 @@ import torch.utils.data as d
 from torch.utils.data import DataLoader, random_split
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
 from src.dataio.data import build_loaders_bits
-from src.early_exit import eval_exit1_epoch, eval_final_acc, eval_overall_at_thr
+from src.early_exit import eval_backbone_profile, eval_exit1_epoch, eval_final_acc, eval_overall_at_thr, print_eval_profile
 from src.prune import *
 from src.tools.fpga_tools.fpga_export_utils import export_lut_init_files
 from src.tools.lut_converage import lut_pattern_coverage
@@ -330,5 +330,7 @@ if __name__ == "__main__":
     print(f"[Backbone] train_acc={train_acc_before*100:.2f}% |"
           f"val_acc={val_acc_before*100:.2f}% | "
         f"test_acc={test_acc_before*100:.2f}%")
+    backbone_profile = eval_backbone_profile(model, test_loader, device)
+    print_eval_profile("Backbone-v2", backbone_profile)
     
     

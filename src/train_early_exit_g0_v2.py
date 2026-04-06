@@ -493,6 +493,7 @@ if __name__ == "__main__":
         )
         print(thr, out["exit_rate"], out["overall_acc"], out["exited_acc"], out["non_exited_acc"],
               out["margin_mean"], out["margin_p95"])
+        print_eval_profile(f"G0-v2 exit0@thr={thr}", out)
     
     print('=======================================')
     thrs0 = [0.5, 1.0, 1.5]
@@ -527,4 +528,4 @@ if __name__ == "__main__":
                 "compute", round(compute_ratio, 4))'''
 
             print(thr0, thr1, out)
-
+            print_eval_profile(f"G0-v2 cascade@({thr0},{thr1})", out)
