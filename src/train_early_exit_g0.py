@@ -21,7 +21,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 CANONICAL_MAPPING = Path("/Users/yi-chunchen/workspace/WNN_early_exit/models/meta/tuple_mapping.json")
 
-def load_or_create_mapping(bit_len, tiles, num_luts, addr_bits, seed=42, save_path=CANONICAL_MAPPING):
+def load_or_create_mapping(bit_len, tiles, num_luts, addr_bits, seed=3, save_path=CANONICAL_MAPPING):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     if save_path.exists():
         mapping = json.loads(save_path.read_text())
@@ -291,7 +291,7 @@ if __name__ == "__main__":
     total_size = len(x_train)
     val_size = int(0.1 * total_size)
     train_size = total_size - val_size
-    seed = torch.Generator().manual_seed(42)
+    seed = torch.Generator().manual_seed(3)
 
     train_ds, val_ds = random_split(
         TensorDataset(x_train, y_train),
@@ -485,3 +485,4 @@ if __name__ == "__main__":
     print(f"[G0 Final head only] test_acc={final_acc*100:.2f}%")
     m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
     print(f"[G0 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
+    print_eval_profile("G0 Overall@thr=2.0", m)

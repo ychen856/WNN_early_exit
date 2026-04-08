@@ -23,7 +23,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 CANONICAL_MAPPING = Path("/Users/yi-chunchen/workspace/WNN_early_exit/models/meta/tuple_mapping.json")
 
-def load_or_create_mapping(bit_len, tiles, num_luts, addr_bits, seed=42, save_path=CANONICAL_MAPPING):
+def load_or_create_mapping(bit_len, tiles, num_luts, addr_bits, seed=3, save_path=CANONICAL_MAPPING):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     if save_path.exists():
         mapping = json.loads(save_path.read_text())
@@ -358,12 +358,23 @@ def train_g2(
 
             final_logits, exit1_logits, exit_mask = model.forward_g2_with_mask(xb, thr=cfg.thr_eval)
 
-            if (~exit_mask).any():
+            '''if (~exit_mask).any():
                 loss_final = F.cross_entropy(final_logits[~exit_mask], yb[~exit_mask])
             else:
                 loss_final = torch.zeros([], device=xb.device)
-                continue
+                continue'''
+            
+            #loss_final = F.cross_entropy(final_logits, yb)
 
+            ce_all = F.cross_entropy(final_logits, yb)
+            if (~exit_mask).any():
+                ce_tail = F.cross_entropy(final_logits[~exit_mask], yb[~exit_mask])
+            else:
+                ce_tail = 0.0 * ce_all
+            beta = 0.1
+            loss_final = ce_all + beta * ce_tail      # beta 建議 0.1~0.5
+
+            
             loss = loss_final  # G2 不含 exit loss
             loss.backward()
             optimizer.step()
@@ -492,7 +503,7 @@ if __name__ == "__main__":
     total_size = len(x_train)
     val_size = int(0.1 * total_size)
     train_size = total_size - val_size
-    seed = torch.Generator().manual_seed(42)
+    seed = torch.Generator().manual_seed(3)
 
     train_ds, val_ds = random_split(
         TensorDataset(x_train, y_train),
@@ -622,5 +633,6 @@ if __name__ == "__main__":
     print(f"[G2 Final head only] test_acc={final_acc*100:.2f}%")
     m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
     print(f"[G2 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
+    print_eval_profile("G2 Overall@thr=2.0", m)
 
     
