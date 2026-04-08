@@ -623,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep_mode", type=str, default="p*(1-p)*std", help='broadcast ok')
     parser.add_argument("--exit_tau", type=str, default="1.0", help='broadcast ok')
 
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--batch_size_cached", type=int, default=512)
@@ -678,7 +678,7 @@ if __name__ == "__main__":
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        num_epochs=30,
+        num_epochs=args.epochs,
 
         # g3: train all, so either omit or:
         train_layer_indices=None,

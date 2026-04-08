@@ -15,6 +15,147 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _count_parameters(module: Optional[nn.Module]) -> int:
+    if module is None:
+        return 0
+    return sum(p.numel() for p in module.parameters())
+
+
+def _linear_flops_and_macs(linear: Optional[nn.Linear]) -> Tuple[float, float]:
+    if linear is None:
+        return 0.0, 0.0
+    macs = float(linear.in_features * linear.out_features)
+    bias_flops = float(linear.out_features if linear.bias is not None else 0.0)
+    flops = 2.0 * macs + bias_flops
+    return flops, macs
+
+
+def _lut_layer_flops_and_macs(layer) -> Tuple[float, float]:
+    """
+    FLOP/MAC convention used in this repo:
+      - LUT layers contribute comparisons, index construction, and sigmoid as FLOPs.
+      - LUT table lookups are counted as 0 MACs.
+      - Dense classifiers contribute standard dense-layer MACs/FLOPs.
+    """
+    in_bits = float(layer.in_bits)
+    num_luts = float(layer.num_luts)
+    k = float(layer.lut_input_size)
+    flops = in_bits + num_luts * (2.0 * k + 1.0)
+    macs = 0.0
+    return flops, macs
+
+
+def get_model_profile(model: nn.Module) -> Dict[str, object]:
+    layer_profiles = []
+    backbone_flops = 0.0
+    backbone_macs = 0.0
+
+    for layer in model.layers:
+        layer_flops, layer_macs = _lut_layer_flops_and_macs(layer)
+        layer_profiles.append(
+            {
+                "flops": layer_flops,
+                "macs": layer_macs,
+                "num_luts": int(layer.num_luts),
+                "lut_input_size": int(layer.lut_input_size),
+            }
+        )
+        backbone_flops += layer_flops
+        backbone_macs += layer_macs
+
+    final_flops, final_macs = _linear_flops_and_macs(getattr(model, "classifier", None))
+    exit_flops, exit_macs = _linear_flops_and_macs(getattr(model, "exit1_classifier", None))
+
+    backbone_params = _count_parameters(model.layers) + _count_parameters(getattr(model, "classifier", None))
+    exit_head_params = _count_parameters(getattr(model, "exit1_classifier", None))
+    param_overhead_ratio = (exit_head_params / backbone_params) if backbone_params > 0 else float("nan")
+
+    return {
+        "num_backbone_layers": len(layer_profiles),
+        "layers": layer_profiles,
+        "final_head": {"flops": final_flops, "macs": final_macs},
+        "exit_head": {"flops": exit_flops, "macs": exit_macs},
+        "backbone_full_flops": backbone_flops + final_flops,
+        "backbone_full_macs": backbone_macs + final_macs,
+        "backbone_params": backbone_params,
+        "exit_head_params": exit_head_params,
+        "param_overhead_ratio": param_overhead_ratio,
+    }
+
+
+def print_eval_profile(tag: str, metrics: Dict[str, float]) -> None:
+    print(
+        f"[{tag} Profile] "
+        f"avg_flops/sample={metrics['avg_flops_per_sample']:.2f} | "
+        f"avg_macs/sample={metrics['avg_macs_per_sample']:.2f} | "
+        f"avg_layers/sample={metrics['avg_layers_executed_per_sample']:.4f} | "
+        f"backbone_params={int(metrics['backbone_params'])} | "
+        f"exit_head_params={int(metrics['total_exit_head_params'])} | "
+        f"param_overhead_ratio={metrics['param_overhead_ratio']:.6f} | "
+        f"compute_overhead_ratio={metrics['compute_overhead_ratio']:.6f} | "
+        f"compute_saving_ratio={metrics['compute_saving_ratio']:.6f}"
+    )
+
+
+@torch.no_grad()
+def eval_backbone_profile(model: nn.Module, loader, device) -> Dict[str, float]:
+    model.eval()
+    profile = get_model_profile(model)
+
+    total = 0
+    correct = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        pred = logits.argmax(dim=-1)
+        correct += (pred == yb).sum().item()
+        total += yb.numel()
+
+    return {
+        "overall_acc": correct / max(total, 1),
+        "avg_flops_per_sample": profile["backbone_full_flops"],
+        "avg_macs_per_sample": profile["backbone_full_macs"],
+        "avg_layers_executed_per_sample": float(profile["num_backbone_layers"]),
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": 0.0,
+        "param_overhead_ratio": 0.0,
+        "compute_overhead_ratio": 1.0,
+        "compute_saving_ratio": 0.0,
+    }
+
+
+def get_multi_exit_profile(model: nn.Module, exit_heads, exit_cfg_list) -> Dict[str, object]:
+    profile = get_model_profile(model)
+    exit_profiles = []
+    total_exit_head_params = 0
+
+    if exit_heads is None:
+        exit_heads = []
+    if exit_cfg_list is None:
+        exit_cfg_list = []
+
+    for cfg, head in zip(exit_cfg_list, exit_heads):
+        head_flops, head_macs = _linear_flops_and_macs(getattr(head, "classifier", None))
+        head_params = _count_parameters(head)
+        total_exit_head_params += head_params
+        exit_profiles.append(
+            {
+                "layer_idx": int(cfg["layer_idx"]),
+                "flops": head_flops,
+                "macs": head_macs,
+                "params": head_params,
+            }
+        )
+
+    profile["exit_heads"] = exit_profiles
+    profile["total_exit_head_params"] = total_exit_head_params
+    profile["param_overhead_ratio"] = (
+        total_exit_head_params / profile["backbone_params"]
+        if profile["backbone_params"] > 0 else float("nan")
+    )
+    return profile
+
+
 @torch.no_grad()
 def _forward_hidden_upto(model, x_bits: torch.Tensor, layer_idx: int):
     """
@@ -66,6 +207,7 @@ def eval_overall_at_thr_multi_exit(
       exited, non_exited, total
     """
     model.eval()
+    profile = get_multi_exit_profile(model, exit_heads, exit_cfg_list)
 
     cfg = exit_cfg_list[exit_id]
     layer_idx = int(cfg["layer_idx"])
@@ -78,12 +220,16 @@ def eval_overall_at_thr_multi_exit(
     correct_exited = 0
     non_exited = 0
     correct_non_exited = 0
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
 
     all_margins = []
 
     exit_head = exit_heads[exit_id].to(device)
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
+        batch_size = yb.numel()
 
         # --- final logits (always full model) ---
         final_logits = model(xb)  # assumes model(x) returns final logits
@@ -105,7 +251,7 @@ def eval_overall_at_thr_multi_exit(
 
         pred = mixed.argmax(dim=-1)
         correct_overall += (pred == yb).sum().item()
-        total += yb.numel()
+        total += batch_size
 
         if exit_mask.any():
             exited += int(exit_mask.sum().item())
@@ -118,6 +264,18 @@ def eval_overall_at_thr_multi_exit(
             pred_full = final_logits.argmax(dim=-1)
             correct_non_exited += (pred_full[ne_mask] == yb[ne_mask]).sum().item()
 
+        exited_batch = float(exit_mask.sum().item())
+        non_exited_batch = float(batch_size - exited_batch)
+        exit_profile = profile["exit_heads"][exit_id]
+        prefix_flops = sum(layer["flops"] for layer in profile["layers"][: layer_idx + 1])
+        prefix_macs = sum(layer["macs"] for layer in profile["layers"][: layer_idx + 1])
+        tail_flops = sum(layer["flops"] for layer in profile["layers"][layer_idx + 1:]) + profile["final_head"]["flops"]
+        tail_macs = sum(layer["macs"] for layer in profile["layers"][layer_idx + 1:]) + profile["final_head"]["macs"]
+
+        total_flops += batch_size * (prefix_flops + exit_profile["flops"]) + non_exited_batch * tail_flops
+        total_macs += batch_size * (prefix_macs + exit_profile["macs"]) + non_exited_batch * tail_macs
+        total_layers += batch_size * float(layer_idx + 1) + non_exited_batch * float(profile["num_backbone_layers"] - (layer_idx + 1))
+
     margins = torch.cat(all_margins, dim=0) if len(all_margins) else torch.tensor([])
     margin_mean = float(margins.mean().item()) if margins.numel() else float("nan")
     margin_p95 = float(torch.quantile(margins, 0.95).item()) if margins.numel() else float("nan")
@@ -126,6 +284,12 @@ def eval_overall_at_thr_multi_exit(
     exit_rate = exited / max(total, 1)
     exited_acc = correct_exited / max(exited, 1)
     non_exited_acc = (correct_non_exited / non_exited) if non_exited > 0 else float("nan")
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+    compute_saving_ratio = 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan")
 
     return {
         "overall_acc": overall_acc,
@@ -137,6 +301,14 @@ def eval_overall_at_thr_multi_exit(
         "exited": exited,
         "non_exited": non_exited,
         "total": total,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": compute_saving_ratio,
     }
 
 
@@ -189,6 +361,7 @@ def eval_cascade_multi_exit(
     for h in exit_heads:
         h.eval()
     exit_heads = [h.to(device).eval() for h in exit_heads]
+    profile = get_multi_exit_profile(model, exit_heads, exit_cfg_list)
 
     total = 0
     correct = 0
@@ -270,6 +443,41 @@ def eval_cascade_multi_exit(
         "final_rate": n_final / max(total, 1),
         "final_acc": (c_final / n_final) if n_final > 0 else float("nan"),
     }
+
+    route_flops = []
+    route_macs = []
+    route_layers = []
+    for i, exit_prof in enumerate(profile["exit_heads"]):
+        layer_idx = int(exit_prof["layer_idx"])
+        flops = sum(layer["flops"] for layer in profile["layers"][: layer_idx + 1])
+        macs = sum(layer["macs"] for layer in profile["layers"][: layer_idx + 1])
+        flops += sum(h["flops"] for h in profile["exit_heads"][: i + 1])
+        macs += sum(h["macs"] for h in profile["exit_heads"][: i + 1])
+        route_flops.append(flops)
+        route_macs.append(macs)
+        route_layers.append(float(layer_idx + 1))
+
+    final_route_flops = sum(layer["flops"] for layer in profile["layers"]) + profile["final_head"]["flops"] + sum(h["flops"] for h in profile["exit_heads"])
+    final_route_macs = sum(layer["macs"] for layer in profile["layers"]) + profile["final_head"]["macs"] + sum(h["macs"] for h in profile["exit_heads"])
+    final_route_layers = float(profile["num_backbone_layers"])
+
+    avg_flops_per_sample = sum(rate * flops for rate, flops in zip(out["exit_rates"], route_flops)) + out["final_rate"] * final_route_flops
+    avg_macs_per_sample = sum(rate * macs for rate, macs in zip(out["exit_rates"], route_macs)) + out["final_rate"] * final_route_macs
+    avg_layers_executed_per_sample = sum(rate * layers for rate, layers in zip(out["exit_rates"], route_layers)) + out["final_rate"] * final_route_layers
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+    compute_saving_ratio = 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan")
+
+    out.update({
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": compute_saving_ratio,
+    })
 
     if log_margins:
         # 每個 exit 各自的 margin mean/p95
@@ -360,6 +568,14 @@ def sweep_thr_table(
             "non_exited_acc": float(m["non_exited_acc"]),
             "margin_mean": float(m["margin_mean"]),
             "margin_p95": float(m["margin_p95"]),
+            "avg_flops_per_sample": float(m["avg_flops_per_sample"]),
+            "avg_macs_per_sample": float(m["avg_macs_per_sample"]),
+            "avg_layers_executed_per_sample": float(m["avg_layers_executed_per_sample"]),
+            "backbone_params": float(m["backbone_params"]),
+            "total_exit_head_params": float(m["total_exit_head_params"]),
+            "param_overhead_ratio": float(m["param_overhead_ratio"]),
+            "compute_overhead_ratio": float(m["compute_overhead_ratio"]),
+            "compute_saving_ratio": float(m["compute_saving_ratio"]),
             "exited": int(m.get("exited", 0)),
             "non_exited": int(m.get("non_exited", 0)),
             "total": int(m.get("total", 0)),
@@ -378,7 +594,7 @@ def pretty_print_table(rows: List[Dict[str, float]], title: str = ""):
         print(title)
 
     header = (
-        "thr    exit%   overall%  exit_acc%  non_exit_acc%  m_mean  m_p95 exited non_exited  total"
+        "thr    exit%   overall%  exit_acc%  non_exit_acc%  m_mean  m_p95  avg_flops  avg_macs  avg_layers  exit_params  param_ovh  compute_ovh  saving  exited non_exited  total"
     )
     print(header)
     print("-" * len(header))
@@ -392,12 +608,24 @@ def pretty_print_table(rows: List[Dict[str, float]], title: str = ""):
         nep = (100.0 * ne) if (ne == ne) else float("nan")  # NaN safe
         m_mean = r["margin_mean"]
         m_p95 = r["margin_p95"]
+        avg_flops = r["avg_flops_per_sample"]
+        avg_macs = r["avg_macs_per_sample"]
+        avg_layers = r["avg_layers_executed_per_sample"]
+        exit_params = r["total_exit_head_params"]
+        param_overhead_ratio = r["param_overhead_ratio"]
+        compute_overhead_ratio = r["compute_overhead_ratio"]
+        compute_saving_ratio = r["compute_saving_ratio"]
         exited = r.get("exited", 0)
         non_exited = r.get("non_exited", 0)
         total = r.get("total", 0)
 
-
-        print(f"{thr:>4.2f}  {exitp:>6.2f}  {overallp:>8.2f}  {exitedp:>9.2f}  {nep:>13.2f}  {m_mean:>6.2f}  {m_p95:>6.2f} {exited:>7d}  {non_exited:>10d}  {total:>7d}")
+        print(
+            f"{thr:>4.2f}  {exitp:>6.2f}  {overallp:>8.2f}  {exitedp:>9.2f}  "
+            f"{nep:>13.2f}  {m_mean:>6.2f}  {m_p95:>6.2f}  {avg_flops:>9.2f}  "
+            f"{avg_macs:>8.2f}  {avg_layers:>10.4f}  {int(exit_params):>11d}  "
+            f"{param_overhead_ratio:>9.6f}  {compute_overhead_ratio:>11.6f}  "
+            f"{compute_saving_ratio:>6.4f} {exited:>7d}  {non_exited:>10d}  {total:>7d}"
+        )
 
 
 def stage2_sweep_val_test(
@@ -423,9 +651,24 @@ def stage2_sweep_val_test(
 
     print("\n=== Best thr by VAL overall ===")
     print(f"thr*={best_thr:.2f} | val_overall={best_val_row['overall_acc']*100:.2f}% "
-          f"val_exit_rate={best_val_row['exit_rate']*100:.2f}%")
+          f"val_exit_rate={best_val_row['exit_rate']*100:.2f}% "
+          f"val_avg_flops={best_val_row['avg_flops_per_sample']:.2f} "
+          f"val_avg_macs={best_val_row['avg_macs_per_sample']:.2f} "
+          f"val_avg_layers={best_val_row['avg_layers_executed_per_sample']:.4f} "
+          f"val_compute_ovh={best_val_row['compute_overhead_ratio']:.6f} "
+          f"val_saving={best_val_row['compute_saving_ratio']:.6f}")
     print(f"          test_overall={best_test_row['overall_acc']*100:.2f}% "
-          f"test_exit_rate={best_test_row['exit_rate']*100:.2f}%")
+          f"test_exit_rate={best_test_row['exit_rate']*100:.2f}% "
+          f"test_avg_flops={best_test_row['avg_flops_per_sample']:.2f} "
+          f"test_avg_macs={best_test_row['avg_macs_per_sample']:.2f} "
+          f"test_avg_layers={best_test_row['avg_layers_executed_per_sample']:.4f} "
+          f"test_compute_ovh={best_test_row['compute_overhead_ratio']:.6f} "
+          f"test_saving={best_test_row['compute_saving_ratio']:.6f}")
+    print(
+        f"          backbone_params={int(best_test_row['backbone_params'])} "
+        f"exit_head_params={int(best_test_row['total_exit_head_params'])} "
+        f"param_overhead_ratio={best_test_row['param_overhead_ratio']:.6f}"
+    )
 
     return {
         "rows_val": rows_val,
@@ -495,6 +738,7 @@ def eval_overall_at_thr(
       margin_mean, margin_p95  (computed on all samples)
     """
     model.eval()
+    profile = get_model_profile(model)
 
     total = 0
     correct_overall = 0
@@ -502,11 +746,15 @@ def eval_overall_at_thr(
     correct_exited = 0
     non_exited = 0
     correct_non_exited = 0
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
 
     all_margins: List[torch.Tensor] = []
 
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
+        batch_size = yb.numel()
 
         final_logits, exit1_logits, _ = model.forward_with_all_hidden_and_exits(xb)  # to get all hidden states + exit logits if needed
         
@@ -529,7 +777,7 @@ def eval_overall_at_thr(
 
         pred = mixed.argmax(dim=-1)
         correct_overall += (pred == yb).sum().item()
-        total += yb.numel()
+        total += batch_size
 
         if exit_mask.any():
             exited += exit_mask.sum().item()
@@ -542,6 +790,18 @@ def eval_overall_at_thr(
             pred_full = final_logits.argmax(dim=-1)
             correct_non_exited += (pred_full[ne_mask] == yb[ne_mask]).sum().item()
 
+        non_exited_batch = float(batch_size - exit_mask.sum().item())
+        layer1_flops = profile["layers"][0]["flops"]
+        layer1_macs = profile["layers"][0]["macs"]
+        exit_head_flops = profile["exit_head"]["flops"]
+        exit_head_macs = profile["exit_head"]["macs"]
+        tail_flops = sum(layer["flops"] for layer in profile["layers"][1:]) + profile["final_head"]["flops"]
+        tail_macs = sum(layer["macs"] for layer in profile["layers"][1:]) + profile["final_head"]["macs"]
+
+        total_flops += batch_size * (layer1_flops + exit_head_flops) + non_exited_batch * tail_flops
+        total_macs += batch_size * (layer1_macs + exit_head_macs) + non_exited_batch * tail_macs
+        total_layers += batch_size + non_exited_batch
+
     margins = torch.cat(all_margins, dim=0) if len(all_margins) else torch.tensor([])
     margin_mean = float(margins.mean().item()) if margins.numel() else float("nan")
     margin_p95 = float(torch.quantile(margins, 0.95).item()) if margins.numel() else float("nan")
@@ -550,6 +810,12 @@ def eval_overall_at_thr(
     exit_rate = exited / max(total, 1)
     exited_acc = correct_exited / max(exited, 1)
     non_exited_acc = (correct_non_exited / non_exited) if non_exited > 0 else float("nan")
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+    compute_saving_ratio = 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan")
 
     return {
         "overall_acc": overall_acc,
@@ -561,6 +827,14 @@ def eval_overall_at_thr(
         "exited": exited,
         "non_exited": non_exited,
         "total": total,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": compute_saving_ratio,
     }
 
 
@@ -1231,5 +1505,3 @@ def _head_logits_from_hidden_trainable(head, h, device):
         sigma = head.sigma.to(device)
         x = (x - mu) / sigma
     return head.classifier(x) / head.exit_tau
-
-
