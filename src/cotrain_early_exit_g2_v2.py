@@ -361,6 +361,7 @@ def cotrain_g2_multi_exit(
 
     Best model selected by eval_cascade_multi_exit(val, thrs).
     """
+    beta_tail = 0.1
     model = model.to(device)
 
     assert len(exit_heads) == len(payload_exit_cfg), "exit_heads and payload_exit_cfg must align"
@@ -448,6 +449,27 @@ def cotrain_g2_multi_exit(
             # per-sample CE
             ce_final = F.cross_entropy(final_logits, yb, reduction="none")  # [B]
 
+            # Mirror g2.py: penalize final head on all samples, then upweight
+            # the "tail" samples that are not taken by any early exit.
+            tail_mask = torch.ones_like(yb, dtype=torch.bool)
+            for i in range(num_exits):
+                cfg = payload_exit_cfg[i]
+                layer_idx = int(cfg["layer_idx"])
+                thr_i = float(thrs[i])
+
+                h_i = h_list[layer_idx]
+                logits_i = _head_logits_from_hidden_trainable(exit_heads[i], h_i, device)
+                margin_i = _margin_from_logits(logits_i, use_prob=use_prob_margin)
+                exit_mask_i = tail_mask & (margin_i > thr_i)
+                tail_mask = tail_mask & (~exit_mask_i)
+
+            ce_all = ce_final.mean()
+            if tail_mask.any():
+                ce_tail = F.cross_entropy(final_logits[tail_mask], yb[tail_mask])
+            else:
+                ce_tail = 0.0 * ce_all
+            loss_final = ce_all + beta_tail * ce_tail
+
             # -------- gate-aware weighting --------
             if use_gate_weighting:
                 # soft gate weights w_i = sigmoid((margin_i - thr_i)/T)
@@ -522,15 +544,10 @@ def cotrain_g2_multi_exit(
                     #u = u * (1.0 - w_i.detach())
                     u = u * (1.0 - w_i)
 
-                # final weighted average
-                u_det = u.detach()
-                loss_final = (u_det * ce_final).sum() / (u_det.sum() + eps)
-
                 loss = lambda_final * loss_final + loss_exit_sum
 
             else:
                 # fallback: 原本的 naive loss
-                loss_final = ce_final.mean()
                 loss_exit_sum = 0.0
                 for i in range(num_exits):
                     cfg = payload_exit_cfg[i]
