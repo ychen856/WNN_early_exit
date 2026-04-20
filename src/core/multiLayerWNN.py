@@ -9,7 +9,24 @@ from src.core.wnnLutLayer import WNNLUTLayer
 from src.exit.ckpt_exit import normalize_exit_cfg_list
 from src.tools.utils import get_exit1_features, make_dropout_schedule
 
+class LogitHead(nn.Module):
 
+    def __init__(self, in_dim, num_classes, eps=1e-4):
+
+        super().__init__()
+
+        self.eps = eps
+
+        self.fc = nn.Linear(in_dim, num_classes, bias=True)
+
+    def forward(self, x):
+
+        x = x.clamp(self.eps, 1 - self.eps)
+
+        x = torch.log(x) - torch.log1p(-x)   # logit(x)
+
+        return self.fc(x)
+    
 class MultiLayerWNN(nn.Module):
     def __init__(
         self,
@@ -19,8 +36,10 @@ class MultiLayerWNN(nn.Module):
         hidden_luts=(2000, 1000),
         mapping=None,
         tau: float = 1.0,
+        lut_tau_list: Optional[List[float]] = None,  # 如果你想每层不同 tau，可以传这个 list（长度要和 hidden_luts 一致）
         exit_tau: float = 1.0,
-        dropout_p=0.0
+        dropout_p=0.0,
+        #random_seed=None,
     ):
         super().__init__()
         self.tau = tau
@@ -45,6 +64,7 @@ class MultiLayerWNN(nn.Module):
         # 每層 dropout schedule
         drop_ps = make_dropout_schedule(dropout_p, num_layers=len(hidden_luts))
 
+        base = 128
         for i, n_lut in enumerate(hidden_luts):
             layer_mapping = mapping if i == 0 else None
             binarize_input = (i == 0)
@@ -55,8 +75,11 @@ class MultiLayerWNN(nn.Module):
                     num_luts=n_lut,
                     lut_input_size=lut_input_size,
                     mapping=layer_mapping,
+                    #random_seed=None if random_seed is None else random_seed + i,
                     binarize_input=binarize_input,
                     dropout_p=drop_ps[i],
+                    random_seed=base + i if base is not None else None,
+                    tau=lut_tau_list[i] if lut_tau_list is not None else 1.0,
                 )
             )
 
@@ -66,6 +89,13 @@ class MultiLayerWNN(nn.Module):
 
         self.layers = nn.ModuleList(layers)
         self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
+        '''self.classifier = nn.Sequential(
+            nn.Linear(prev_bits, 128, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, num_classes, bias=True),
+        )'''
+        #self.classifier = LogitHead(prev_bits, num_classes)
 
         # for hidden pruning
         self.register_buffer("keep_idx", torch.empty(0, dtype=torch.long))
@@ -144,7 +174,8 @@ class MultiLayerWNN(nn.Module):
             h_used = h[:, self.keep_idx]
         else:
             h_used = h
-        final_logits = self.classifier(h_used) / self.tau
+        #final_logits = self.classifier(h_used) / self.tau
+        final_logits = self.classifier(h_used)
 
         return final_logits, exit1_logits, h_list
 
@@ -297,6 +328,7 @@ def build_model_from_configs(backbone_config: Dict[str, Any],
         hidden_luts=tuple(cfg["hidden_luts"]),
         mapping=cfg.get("mapping", None),
         tau=float(cfg.get("tau", 1.0)),
+        lut_tau_list=cfg.get("lut_tau_list", None),
     ).to(device)
     print("[A] after ctor:", list(dict(model.named_buffers()).keys()))
     

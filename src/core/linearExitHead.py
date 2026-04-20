@@ -8,6 +8,7 @@ class ExitHead(nn.Module):
     def __init__(self, k: int, num_classes: int, exit_tau: float,
                  exit_keep_idx: torch.Tensor,
                  mu: torch.Tensor, sigma: torch.Tensor,
+                 #exit_tau = 1,
                  use_norm: bool = False):
         super().__init__()
         self.k = k
@@ -17,6 +18,9 @@ class ExitHead(nn.Module):
         self.register_buffer("exit_keep_idx", exit_keep_idx.long())
         self.register_buffer("mu", mu.float())
         self.register_buffer("sigma", sigma.float())
+
+
+        #self.exit_tau = exit_tau  # 或者單獨設
 
         self.classifier = nn.Linear(k, num_classes, bias=False)
 

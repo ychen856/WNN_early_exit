@@ -69,55 +69,20 @@ def train_model(
     val_loader,
     device,
     #num_epochs=50,
-    num_epochs=100,
+    num_epochs=90,
     #base_lr=3e-3,
-    base_lr=1e-3,
+    base_lr=1e-2,
     weight_decay=1e-3,
     #eta_min=1e-4,          # cosine 最低 lr
     eta_min=1e-5,          # cosine 最低 lr
     grad_clip=1.0,
     early_stop_patience=0, # 0 = 不 early stop；建議先設 8
 ):
-    warmup_epochs = 5
-    warmup_start_lr = 1e-3
-    warmup_end_lr = 3e-3
-
-    #optimizer = torch.optim.AdamW(
-    #    model.parameters(),
-    #    lr=base_lr,
-    #    weight_decay=weight_decay
-    #)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=warmup_start_lr,
+        lr=base_lr,
         weight_decay=weight_decay
     )
-
-    '''# Cosine decay: lr 從 base_lr -> eta_min
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs,
-        eta_min=eta_min
-    )'''
-    '''scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, threshold=1e-3, verbose=True
-    )'''
-    '''scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, threshold=5e-4#, verbose=True
-    )'''
-
-    def lr_lambda(epoch):
-        if warmup_epochs > 0 and epoch < warmup_epochs:
-            progress = epoch / max(warmup_epochs - 1, 1)
-            lr = warmup_start_lr + (warmup_end_lr - warmup_start_lr) * progress
-        else:
-            cosine_progress = (epoch - warmup_epochs) / max(num_epochs - warmup_epochs - 1, 1)
-            cosine_progress = min(max(cosine_progress, 0.0), 1.0)
-            lr = eta_min + 0.5 * (warmup_end_lr - eta_min) * (1 + math.cos(math.pi * cosine_progress))
-
-        return lr / warmup_start_lr
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     best_state = None
     best_val_acc = -1.0
@@ -125,6 +90,18 @@ def train_model(
     no_improve = 0
 
     for epoch in range(num_epochs):
+        if epoch < 30:
+            lr = 1e-2
+        elif epoch < 60:
+            lr = 1e-3
+        elif epoch < 90:
+            lr = 1e-4
+        else:
+            lr = 1e-5
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
         '''# example schedule
         if epoch < 5:
             p = 0.05
@@ -142,7 +119,7 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             logits = model(xb)
             #loss = F.cross_entropy(logits, yb)
-            loss = F.cross_entropy(logits, yb, label_smoothing=0.02)
+            loss = F.cross_entropy(logits, yb, label_smoothing=0.03)
             loss.backward()
 
             if grad_clip is not None and grad_clip > 0:
@@ -170,17 +147,12 @@ def train_model(
                 best_val_acc=best_val_acc,
                 epoch=epoch,
                 optimizer=optimizer,      # 想要可 resume 才存
-                scheduler=scheduler,
+                scheduler=None,
                 extra={"dataset": args.dataset},
             )
             print(f"[BEST] epoch={epoch:03d} val_acc={val_acc*100:.2f}% -> saved")
         else:
             no_improve += 1
-
-
-        # ---- step scheduler (cosine: 每 epoch step) ----
-        #scheduler.step(val_acc)
-        scheduler.step()
 
         # optional: print lr
         cur_lr = optimizer.param_groups[0]["lr"]
@@ -306,10 +278,11 @@ if __name__ == "__main__":
         in_bits=in_bits,
         num_classes=C,
         lut_input_size=2,
-        #hidden_luts=(3000, 1500, 800),
-        hidden_luts=(1000, 500),
+        #hidden_luts=(8000, 8000, 8000),
+        hidden_luts=(8000, 8000),
         #tau=0.165,
         tau=1.0,
+        #lut_tau_list=[10.0, 10.0, 10.0],
         lut_tau_list=[10.0, 5.0],
         mapping=None,
         dropout_p=args.dropout_p,  # ✅ 新增：給 MultiLayerWNN 再往下傳
@@ -329,7 +302,7 @@ if __name__ == "__main__":
     #optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     #model = train_model(model, train_loader, val_loader, device, num_epochs=60, base_lr=args.base_lr, weight_decay=args.weight_decay)
-    model = train_model(model, train_loader, val_loader, device, num_epochs=80, base_lr=args.base_lr, weight_decay=args.weight_decay)
+    model = train_model(model, train_loader, val_loader, device, num_epochs=100, base_lr=args.base_lr, weight_decay=args.weight_decay)
     
     '''rep = lut_pattern_coverage(
         model.layers[0],

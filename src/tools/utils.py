@@ -11,7 +11,18 @@ import numpy as np
 # Utilities
 # ---------------------------
 import torch
-
+def _head_logits_from_hidden(head, h, device):
+    """
+    h: [B, D_layer] on device
+    return logits: [B, C] on device
+    """
+    x = h[:, head.exit_keep_idx.to(device)]
+    if getattr(head, "use_norm", False):
+        mu = head.mu.to(device)
+        sigma = head.sigma.to(device)
+        x = (x - mu) / sigma
+    
+    return head.classifier(x) / head.exit_tau
 
 '''def save_checkpoint(path, model, extra: dict = None):
     # exit info

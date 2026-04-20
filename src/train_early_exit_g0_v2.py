@@ -1,6 +1,7 @@
 # src/train/train_wnn.py
 import argparse
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import json
@@ -496,8 +497,8 @@ if __name__ == "__main__":
         print_eval_profile(f"G0-v2 exit0@thr={thr}", out)
     
     print('=======================================')
-    thrs0 = [0.5, 1.0, 1.5]
-    thrs1 = [1.5, 2.0, 2.5]
+    thrs0 = [0.5, 1.0, 1.5, math.inf]
+    thrs1 = [1.5, 2.0, 2.5, math.inf]
 
     for thr0 in thrs0:
         for thr1 in thrs1:

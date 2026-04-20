@@ -13,7 +13,221 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.tools.utils import _head_logits_from_hidden
 
+def set_requires_grad(module: nn.Module, flag: bool):
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+def _margin_from_logits(logits: torch.Tensor, use_prob: bool = False) -> torch.Tensor:
+    """
+    logits: [B,C]
+    return margin: [B] = top1 - top2
+    """
+    if use_prob:
+        p = torch.softmax(logits, dim=-1)
+        top2 = torch.topk(p, k=2, dim=-1).values
+    else:
+        top2 = torch.topk(logits, k=2, dim=-1).values
+    return top2[:, 0] - top2[:, 1]
+
+
+def _head_logits_from_hidden_trainable(head, h, device):
+    """
+    h: [B, D_layer] on device
+    return logits: [B, C] on device
+    """
+    x = h[:, head.exit_keep_idx.to(device)]
+    if getattr(head, "use_norm", False):
+        mu = head.mu.to(device)
+        sigma = head.sigma.to(device)
+        x = (x - mu) / (sigma + 1e-12)
+    return head.classifier(x) / float(getattr(head, "exit_tau", 1.0))
+
+
+def set_requires_grad(module: nn.Module, flag: bool):
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+@torch.no_grad()
+def _calibrate_thr_from_margins(
+    margins: torch.Tensor,
+    target_rate: float,
+) -> float:
+    """
+    margins: [B] float
+    target_rate: desired fraction taking exit (margin > thr)
+    Return thr so that P(margin > thr) ~= target_rate.
+    """
+    target_rate = float(target_rate)
+    target_rate = max(0.0, min(1.0, target_rate))
+    if target_rate <= 0.0:
+        return float("inf")
+    if target_rate >= 1.0:
+        return 0.0
+
+    # want thr at (1 - target_rate) quantile
+    q = 1.0 - target_rate
+    # torch.quantile expects float tensor
+    thr = torch.quantile(margins, q).item()
+    return float(thr)
+
+@torch.no_grad()
+def _exit_logits_from_hidden_generic(exit_head, h):
+    """
+    Most ExitHead impls are callable: exit_head(h) -> logits.
+    If yours uses a special API, modify here ONLY.
+    """
+    out = exit_head(h)
+    # some heads may return (logits, extra)
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out  # [B,C]
+
+
+@torch.no_grad()
+def _logit_margin(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: [B,C]
+    returns margin: top1 - top2, [B]
+    """
+    top2 = torch.topk(logits, k=2, dim=-1).values
+    return top2[:, 0] - top2[:, 1]
+
+@torch.no_grad()
+def collect_exit_margins(
+    model, loader, device,
+    exit_heads, exit_cfg_list,
+):
+    """
+    Returns:
+      margins: list[tensor], margins[i] shape [N] for exit i
+    """
+    model.eval()
+    for h in exit_heads:
+        h.eval()
+
+    margins = [[] for _ in range(len(exit_heads))]
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+
+        # forward all hidden once
+        # must return: final_logits, h_list
+        final_logits, h_list = model.forward_with_all_hidden(xb)
+
+        for i, head in enumerate(exit_heads):
+            cfg = exit_cfg_list[i]
+            layer_idx = int(cfg["layer_idx"])
+            h_i = h_list[layer_idx]
+
+            logits_i = _exit_logits_from_hidden_generic(head, h_i)  # [B,C]
+            m_i = _logit_margin(logits_i)                            # [B]
+            margins[i].append(m_i.cpu())
+
+    margins = [torch.cat(x, dim=0) if len(x) else torch.empty(0) for x in margins]
+    return margins
+
+def make_thr_candidates_from_quantiles(margin_vec: torch.Tensor, qs=(0.50, 0.70, 0.80, 0.90, 0.95, 0.98)):
+    if margin_vec.numel() == 0:
+        return []
+    thr = []
+    for q in qs:
+        thr.append(float(torch.quantile(margin_vec, q).item()))
+    thr += [0.0, float(margin_vec.mean().item())]
+    thr = sorted(set([round(x, 6) for x in thr]))
+    return thr
+
+@torch.no_grad()
+def sweep_cascade_by_quantile(
+    model, val_loader, device,
+    exit_heads, exit_cfg_list,
+    qs0=(0.50, 0.70, 0.80, 0.90, 0.95, 0.98),
+    qs1=(0.50, 0.70, 0.80, 0.90, 0.95),
+    max_pairs=120,
+):
+    margins = collect_exit_margins(
+        model=model,
+        loader=val_loader,
+        device=device,
+        exit_heads=exit_heads,
+        exit_cfg_list=exit_cfg_list,
+    )
+    assert len(margins) >= 2, "Need >=2 exits"
+
+    thr0_list = make_thr_candidates_from_quantiles(margins[0], qs=qs0)
+    thr1_list = make_thr_candidates_from_quantiles(margins[1], qs=qs1)
+
+    print("\n[quantile thr candidates]")
+    print("thr0:", thr0_list)
+    print("thr1:", thr1_list)
+
+    pairs = [(t0, t1) for t0 in thr0_list for t1 in thr1_list]
+    if len(pairs) > max_pairs:
+        pairs = pairs[:max_pairs//2] + pairs[-max_pairs//2:]
+
+    best = None
+    best_overall = -1.0
+
+    print("\nthr0 thr1 | overall | r0 a0 | r1 a1 | rf af")
+    for t0, t1 in pairs:
+        out = eval_cascade_multi_exit(
+            model, val_loader, device,
+            exit_heads=exit_heads,
+            exit_cfg_list=exit_cfg_list,
+            thrs=[t0, t1],
+            use_prob_margin=False,   # we're using logit margin
+            log_margins=False,
+        )
+        r0, r1 = out["exit_rates"]
+        rf = out["final_rate"]
+        a0, a1 = out["exit_accs"]
+        af = out["final_acc"]
+        overall = out["overall_acc"]
+
+        print(f"{t0:>7.3f} {t1:>7.3f} | {overall:>7.4f} | "
+              f"{r0:>5.3f} {a0:>5.3f} | {r1:>5.3f} {a1:>5.3f} | {rf:>5.3f} {af:>5.3f}")
+
+        if overall > best_overall:
+            best_overall = overall
+            best = (t0, t1, out)
+
+    print("\n[BEST by overall]", best[0], best[1], "overall=", best[2]["overall_acc"])
+    return best, {"thr0": thr0_list, "thr1": thr1_list, "margins": margins}
+
+
+
+
+
+@torch.no_grad()
+def _collect_margins_exit0(model, loader, device, exit0_head, layer0_idx: int = 0, max_batches: Optional[int] = None):
+    """Collect exit0 margins on TRAIN loader to set thr0 by quantile."""
+    model.eval()
+    exit0_head.eval()
+
+    all_m = []
+    for bi, (xb, yb) in enumerate(loader):
+        if max_batches is not None and bi >= max_batches:
+            break
+        xb = xb.to(device)
+
+        final_logits, h_list = model.forward_with_all_hidden(xb)
+        h0 = h_list[layer0_idx]
+        logits0 = _head_logits_from_hidden(exit0_head, h0, device)  # [B,C]
+
+        top2 = torch.topk(logits0, k=2, dim=-1).values
+        m0 = (top2[:, 0] - top2[:, 1]).detach().cpu()  # [B]
+        all_m.append(m0)
+
+    if not all_m:
+        return torch.tensor([])
+    return torch.cat(all_m, dim=0)
+
+def _weighted_avg_loss(per_sample_loss: torch.Tensor, weights: torch.Tensor, eps: float = 1e-8):
+    """Return sum(w*loss)/sum(w). weights can be detached outside."""
+    return (weights * per_sample_loss).sum() / (weights.sum() + eps)
 
 def _count_parameters(module: Optional[nn.Module]) -> int:
     if module is None:
@@ -317,17 +531,7 @@ import torch
 import torch.nn.functional as F
 
 #@torch.no_grad()
-def _head_logits_from_hidden(head, h, device):
-    """
-    h: [B, D_layer] on device
-    return logits: [B, C] on device
-    """
-    x = h[:, head.exit_keep_idx.to(device)]
-    if getattr(head, "use_norm", False):
-        mu = head.mu.to(device)
-        sigma = head.sigma.to(device)
-        x = (x - mu) / sigma
-    return head.classifier(x) / head.exit_tau
+
 
 def _margin_from_logits(logits, use_prob=False):
     if use_prob:

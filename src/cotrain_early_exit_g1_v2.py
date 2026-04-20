@@ -1,6 +1,7 @@
 # src/train/train_wnn.py
 import argparse
 import copy
+import math
 from pathlib import Path
 import json
 from torch.utils.data import DataLoader, random_split
@@ -10,7 +11,7 @@ from src.core.linearExitHead import build_exits_from_ckpt
 from src.core.multiLayerWNN import build_backbone_from_ckpt, save_ckpt_v2
 from src.dataio.data import build_loaders_bits
 from src.dataio.mapping import make_tuple_mapping, audit_mapping
-from src.early_exit import _head_logits_from_hidden
+from src.early_exit import _collect_margins_exit0, _head_logits_from_hidden, _weighted_avg_loss
 from src.exit.ckpt_exit import ExitConfig
 from src.prune import *
 from src.early_exit import *
@@ -21,6 +22,7 @@ from src.dataio.encode import minmax_normalize, thermometer_encode, dt_thermomet
 from src.tools.fpga_tools.export_fpga_bundle import export_multilayer_2layer_for_fpga, verify_multilayer_export
 from torchvision import transforms
 from torch.utils.data import TensorDataset, DataLoader
+
 
 # from core.decision import tune_decision  #  Step 2
 
@@ -421,13 +423,630 @@ def cotrain_g1_layer1_exit1_only(
     return model, best
 
 
-
-
-
 import torch
 import torch.nn.functional as F
 
-def cotrain_g1_stage(
+
+
+@torch.no_grad()
+def eval_exit_only(model, exit_head, loader, device, layer_idx: int):
+    model.eval()
+    exit_head.eval()
+    correct = 0
+    total = 0
+    loss_sum = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        final_logits, h_list = model.forward_with_all_hidden(xb)
+        h = h_list[layer_idx]
+        logits = _head_logits_from_hidden(exit_head, h, device)
+        loss = F.cross_entropy(logits, yb)
+        pred = logits.argmax(dim=-1)
+        correct += (pred == yb).sum().item()
+        total += yb.numel()
+        loss_sum += loss.item() * yb.numel()
+    return loss_sum / total, correct / total
+
+
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+import torch
+import torch.nn.functional as F
+
+import copy
+import torch
+import torch.nn.functional as F
+
+import copy
+import torch
+import torch.nn.functional as F
+
+
+def cotrain_g1_stage_v3(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    *,
+    num_epochs=30,
+    layer_idx: int,
+    exit_id: int,
+    lr_layer=3e-4,
+    lr_exit=3e-3,
+    lambda_exit=1.0,
+
+    # g1 典型：不動 final classifier（你要 g2/g3 才動）
+    use_final_loss=False,
+    lambda_final=1.0,
+
+    # cascade eval 只拿來 report，不拿來選 best（stage1 用 exit-only 選 best）
+    thrs=(1.0, 1.5),
+    weight_decay=1e-3,
+    grad_clip=1.0,
+
+    exit_heads=None,          # list[ExitHead]
+    payload_exit_cfg=None,    # list[dict]
+    use_prob_margin=False,    # keep for eval function signature
+
+    # ---- NEW for Stage1 residual training ----
+    enable_soft_residual: bool = True,
+    target_exit0_rate: float = 0.70,     # keep exit0 taking ~70% during stage1
+    gate_temp0: float = 30.0,            # IMPORTANT: margin scale大(你現在~100~400)，T要大避免變hard mask
+    thr0_update_batches: int = 20,       # 用多少個train batch估thr0（快一點）
+):
+    """
+    G1 stage-wise co-train:
+      - update: model.layers[layer_idx] + exit_heads[exit_id]
+      - freeze: everything else (other layers, final classifier, other exit heads)
+
+    v3 change:
+      - if exit_id==1 and enable_soft_residual:
+          train exit1 on residual distribution using SOFT weights from exit0 margin gate.
+          thr0 is updated each epoch to keep exit0_rate about target_exit0_rate.
+    """
+    assert exit_heads is not None
+    assert payload_exit_cfg is not None
+    assert 0 <= layer_idx < len(model.layers)
+    assert 0 <= exit_id < len(exit_heads)
+
+    model = model.to(device)
+    exit_heads = [h.to(device) for h in exit_heads]
+    exit_module = exit_heads[exit_id]
+
+    # ---- freeze all ----
+    set_requires_grad(model, False)
+    for h in exit_heads:
+        set_requires_grad(h, False)
+
+    # ---- unfreeze current layer + current exit head ----
+    set_requires_grad(model.layers[layer_idx], True)
+    set_requires_grad(exit_module, True)
+
+    # ---- keep final classifier frozen in g1 ----
+    if hasattr(model, "classifier"):
+        set_requires_grad(model.classifier, False)
+
+    params_layer = [p for p in model.layers[layer_idx].parameters() if p.requires_grad]
+    params_exit  = [p for p in exit_module.parameters() if p.requires_grad]
+    assert params_layer and params_exit
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": params_layer, "lr": lr_layer, "weight_decay": weight_decay},
+            {"params": params_exit,  "lr": lr_exit,  "weight_decay": weight_decay},
+        ]
+    )
+
+    # best selection: stage-wise objective
+    best = {"val_metric": -1.0, "state": None, "exit_states": None}
+
+    # ---- Stage1: maintain a dynamic thr0 to prevent starvation ----
+    thr0_dyn = float(thrs[0])  # initial
+    exit0_head = exit_heads[0] if len(exit_heads) > 0 else None
+
+    for epoch in range(num_epochs):
+        # ---------- (A) update thr0 for stage1 ----------
+        if enable_soft_residual and exit_id == 1 and exit0_head is not None:
+            # compute margins on some train batches
+            m0_all = _collect_margins_exit0(
+                model, train_loader, device,
+                exit0_head=exit0_head, layer0_idx=0,
+                max_batches=thr0_update_batches
+            )
+            if m0_all.numel() > 0:
+                # want P(m0 > thr0) ~= target_exit0_rate  => thr0 = quantile(m0, 1-target_exit0_rate)? NO
+                # because exit when m0 > thr0. So exit rate = 1 - CDF(thr0).
+                # set thr0 at (1 - target_exit0_rate) quantile.
+                q = max(0.0, min(1.0, 1.0 - float(target_exit0_rate)))
+                thr0_dyn = float(torch.quantile(m0_all, q).item())
+
+        # ---------- (B) train ----------
+        model.train()
+        exit_module.train()
+        # exit0 head should stay frozen/eval-ish (for stable gate)
+        if exit0_head is not None:
+            exit0_head.eval()
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            final_logits, h_list = model.forward_with_all_hidden(xb)
+            h = h_list[layer_idx]
+            exit_logits = _head_logits_from_hidden(exit_module, h, device)
+
+            # per-sample CE
+            ce_exit = F.cross_entropy(exit_logits, yb, reduction="none")  # [B]
+
+            # -------- soft residual weighting for stage1 only --------
+            if enable_soft_residual and exit_id == 1 and exit0_head is not None:
+                h0 = h_list[0]
+                logits0 = _head_logits_from_hidden(exit0_head, h0, device)  # [B,C]
+                top2 = torch.topk(logits0, k=2, dim=-1).values
+                m0 = top2[:, 0] - top2[:, 1]  # [B]
+
+                # g0 = prob exit0 takes; r = residual prob
+                g0 = torch.sigmoid((m0 - thr0_dyn) / float(gate_temp0))
+                r = (1.0 - g0).detach()  # detach to avoid gate being pushed by CE
+                #print(f'r_mean: {(1 - g0).mean().item():.3f}')
+                #print(f'exit 0 rate: {(g0 > 0.5).float().mean():.4f}')
+
+                loss_exit = _weighted_avg_loss(ce_exit, r)
+            else:
+                loss_exit = ce_exit.mean()
+
+            loss = float(lambda_exit) * loss_exit
+
+            # optional: final loss (normally False for g1)
+            if use_final_loss:
+                loss_final = F.cross_entropy(final_logits, yb)
+                loss = loss + float(lambda_final) * loss_final
+
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(params_layer, grad_clip)
+                torch.nn.utils.clip_grad_norm_(params_exit, grad_clip)
+            optimizer.step()
+
+        # ---------- (C) eval ----------
+        model.eval()
+        for hhh in exit_heads:
+            hhh.eval()
+
+        # stage-wise metric: exit-only acc on its own layer
+        va_exit_loss, va_exit_acc = eval_exit_only(model, exit_module, val_loader, device, layer_idx)
+
+        # report cascade metric (optional)
+        if exit_id == 1:
+            thrs_eval = (float("inf"), float(thrs[1]))
+        else:
+            thrs_eval = thrs
+
+        out = eval_cascade_multi_exit(
+            model, val_loader, device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            thrs=thrs_eval,
+            use_prob_margin=use_prob_margin,
+        )
+        va_overall_acc = float(out["overall_acc"])
+
+        # print debug
+        extra = ""
+        if enable_soft_residual and exit_id == 1:
+            extra = f" | thr0_dyn={thr0_dyn:.3f} T0={gate_temp0} target_r={1-target_exit0_rate:.2f}"
+
+        print(
+            f"[G1-stage-v3] layer={layer_idx} exit={exit_id} Ep{epoch:03d}"
+            f" | exit_only_acc={va_exit_acc*100:.2f}"
+            f" | overall@{thrs_eval} va={va_overall_acc*100:.2f}"
+            f" | exit_rates={out['exit_rates']} final_rate={out['final_rate']:.4f}"
+            f"{extra}"
+        )
+
+        # choose best by stage-wise metric (exit-only)
+        metric = float(va_exit_acc)
+        if metric > best["val_metric"]:
+            best["val_metric"] = metric
+            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best["exit_states"] = [{k: v.detach().cpu().clone() for k, v in hhh.state_dict().items()}
+                                   for hhh in exit_heads]
+
+    # restore best
+    if best["state"] is not None:
+        model.load_state_dict(best["state"], strict=False)
+        for hhh, sd in zip(exit_heads, best["exit_states"]):
+            hhh.load_state_dict(sd, strict=True)
+
+    return model, best
+
+
+
+def cotrain_g1_stage_v4(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    *,
+    num_epochs=30,
+    layer_idx: int,
+    exit_id: int,
+    lr_layer=3e-4,
+    lr_exit=3e-3,
+    weight_decay=1e-3,
+    grad_clip=1.0,
+
+    # IMPORTANT: G1 for head accuracy only
+    lambda_exit=1.0,          # 直接 1.0，別縮小到 0.3（會讓 head 學很慢）
+    label_smoothing=0.0,      # 先關掉，確認 head acc 正常再加回去
+
+    # logging/reporting only
+    exit_heads=None,
+    payload_exit_cfg=None,
+    thrs=(1.0, 1.5),
+    use_prob_margin=False,
+):
+    """
+    Stage-wise co-train (head-accuracy first):
+      - update: model.layers[layer_idx] + exit_heads[exit_id]
+      - freeze: everything else (other layers, final classifier, other exit heads)
+    Best selection: EXIT-ONLY accuracy on val set.
+    Cascade eval: reporting only; stage1 uses (inf, thr1) to avoid starving exit1.
+    """
+    assert exit_heads is not None
+    assert payload_exit_cfg is not None
+    assert 0 <= layer_idx < len(model.layers)
+    assert 0 <= exit_id < len(exit_heads)
+
+    model = model.to(device)
+    exit_heads = [h.to(device) for h in exit_heads]
+    exit_module = exit_heads[exit_id]
+
+    # ---- freeze everything ----
+    set_requires_grad(model, False)
+    for h in exit_heads:
+        set_requires_grad(h, False)
+
+    # ---- unfreeze target layer + target exit ----
+    set_requires_grad(model.layers[layer_idx], True)
+    set_requires_grad(exit_module, True)
+
+    # ---- keep final classifier frozen in G1 ----
+    if hasattr(model, "classifier"):
+        set_requires_grad(model.classifier, False)
+
+    params_layer = [p for p in model.layers[layer_idx].parameters() if p.requires_grad]
+    params_exit  = [p for p in exit_module.parameters() if p.requires_grad]
+    assert params_layer and params_exit
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": params_layer, "lr": lr_layer, "weight_decay": weight_decay},
+            {"params": params_exit,  "lr": lr_exit,  "weight_decay": weight_decay},
+        ]
+    )
+
+    best = {"val_exit_acc": -1.0, "state": None, "exit_states": None}
+
+    for epoch in range(num_epochs):
+        # ---- train ----
+        model.train()
+        exit_module.train()
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            # must keep grad through backbone to layer_idx
+            _, h_list = model.forward_with_all_hidden(xb)
+            h = h_list[layer_idx]
+
+            exit_logits = _head_logits_from_hidden(exit_module, h, device)
+            loss_exit = F.cross_entropy(exit_logits, yb, label_smoothing=label_smoothing)
+            loss = lambda_exit * loss_exit
+
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(params_layer, grad_clip)
+                torch.nn.utils.clip_grad_norm_(params_exit, grad_clip)
+            optimizer.step()
+
+        # ---- eval: EXIT-ONLY (selection metric) ----
+        va_exit_loss, va_exit_acc = eval_exit_only(model, exit_module, val_loader, device, layer_idx)
+
+        # ---- eval: cascade (report only) ----
+        model.eval()
+        for h in exit_heads:
+            h.eval()
+
+        if exit_id == 1 and len(thrs) >= 2:
+            thrs_eval = (float("inf"), float(thrs[1]))
+        else:
+            thrs_eval = thrs
+
+        out = eval_cascade_multi_exit(
+            model, val_loader, device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            thrs=thrs_eval,
+            use_prob_margin=use_prob_margin,
+        )
+
+        print(
+            f"[G1-v3] layer={layer_idx} exit={exit_id} Ep{epoch:03d} | "
+            f"exit_only_acc={va_exit_acc*100:.2f} exit_only_loss={va_exit_loss:.4f} | "
+            f"cascade_overall={out['overall_acc']*100:.2f} exit_rates={out['exit_rates']} rf={out['final_rate']:.4f}"
+        )
+
+        # ---- select best by EXIT-ONLY ----
+        if va_exit_acc > best["val_exit_acc"]:
+            best["val_exit_acc"] = va_exit_acc
+            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best["exit_states"] = [{k: v.detach().cpu().clone() for k, v in h.state_dict().items()}
+                                   for h in exit_heads]
+
+    # restore best
+    if best["state"] is not None:
+        model.load_state_dict(best["state"], strict=False)
+        for h, sd in zip(exit_heads, best["exit_states"]):
+            h.load_state_dict(sd, strict=True)
+
+    return model, best
+
+
+
+
+def cotrain_g1_stage_2(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    *,
+    num_epochs=30,
+    layer_idx: int,
+    exit_id: int,
+    lr_layer=3e-4,
+    lr_exit=3e-3,
+    lambda_exit=0.3,
+    use_final_loss=False,     # 建議 stage-wise 預設 False
+    lambda_final=1.0,
+    thrs=(1.0, 1.5),
+    weight_decay=1e-3,
+    grad_clip=1.0,
+    exit_heads=None,          # list[ExitHead]
+    payload_exit_cfg=None,    # list[dict] (for cascade eval)
+    use_prob_margin=False,
+
+    # ---- new knobs ----
+    warmup_head_epochs: int = 8,     # ✅ 建議 5~10
+    warmup_lr_exit: float = None,    # None -> use lr_exit
+    best_on: str = "exit_only_acc",  # "exit_only_acc" or "overall_acc"（不建議用 overall）
+    report_cascade: bool = True,     # 只用來 print / 觀察
+):
+    """
+    G1 stage-wise co-train (improved):
+      - Warmup: train ONLY exit head for a few epochs (stabilize feature->logit alignment)
+      - Cotrain: train backbone layer[layer_idx] + that exit head
+      - Best selection: by exit-only metric (default), to avoid starving the exit.
+
+    Notes:
+      - Everything else is frozen (other backbone layers, final classifier, other exit heads)
+      - Cascade eval is only for reporting; stage selection uses exit-only metric.
+    """
+    assert exit_heads is not None, "exit_heads required"
+    assert payload_exit_cfg is not None, "payload_exit_cfg required for cascade eval"
+    assert 0 <= layer_idx < len(model.layers)
+    assert 0 <= exit_id < len(exit_heads)
+
+    model = model.to(device)
+    exit_heads = [h.to(device) for h in exit_heads]
+    exit_module = exit_heads[exit_id]
+
+    # -----------------------
+    # helpers
+    # -----------------------
+    def _snapshot_state():
+        return {
+            "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "exits": [{k: v.detach().cpu().clone() for k, v in h.state_dict().items()} for h in exit_heads],
+        }
+
+    def _restore_state(state):
+        model.load_state_dict(state["model"], strict=False)
+        for h, sd in zip(exit_heads, state["exits"]):
+            h.load_state_dict(sd, strict=True)
+
+    def _thrs_eval_for_reporting():
+        # keep your rule: during stage training of exit1, don't let exit0 take samples in cascade reporting
+        if exit_id == 1 and len(thrs) >= 2:
+            return (float("inf"), float(thrs[1]))
+        return thrs
+
+    def _compute_losses(final_logits, exit_logits, yb):
+        loss_exit = F.cross_entropy(exit_logits, yb)
+        if use_final_loss:
+            loss_final = F.cross_entropy(final_logits, yb)
+            loss = lambda_final * loss_final + lambda_exit * loss_exit
+        else:
+            loss_final = None
+            loss = lambda_exit * loss_exit
+        return loss, loss_exit, loss_final
+
+    # -----------------------
+    # 0) Freeze everything first
+    # -----------------------
+    set_requires_grad(model, False)
+    for h in exit_heads:
+        set_requires_grad(h, False)
+
+    # keep final classifier frozen in g1
+    if hasattr(model, "classifier"):
+        set_requires_grad(model.classifier, False)
+
+    # -----------------------
+    # 1) Warmup: train ONLY exit head
+    # -----------------------
+    best = {"val_metric": -1.0, "state": None, "val_overall_acc": None, "val_exit_acc": None}
+
+    warmup_epochs = int(max(0, warmup_head_epochs))
+    warmup_lr = float(lr_exit if warmup_lr_exit is None else warmup_lr_exit)
+
+    if warmup_epochs > 0:
+        set_requires_grad(exit_module, True)
+
+        params_exit = [p for p in exit_module.parameters() if p.requires_grad]
+        assert len(params_exit) > 0, "No trainable params in selected exit head (warmup)"
+
+        opt_warm = torch.optim.AdamW(
+            [{"params": params_exit, "lr": warmup_lr, "weight_decay": weight_decay}]
+        )
+
+        for epoch in range(warmup_epochs):
+            model.train()
+            exit_module.train()
+
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                opt_warm.zero_grad(set_to_none=True)
+
+                # forward backbone -> hidden
+                final_logits, h_list = model.forward_with_all_hidden(xb)
+                h = h_list[layer_idx]
+                exit_logits = _head_logits_from_hidden(exit_module, h, device)
+
+                loss, _, _ = _compute_losses(final_logits, exit_logits, yb)
+                loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(params_exit, grad_clip)
+                opt_warm.step()
+
+            # ---- eval ----
+            model.eval()
+            for hmod in exit_heads:
+                hmod.eval()
+
+            va_exit_loss, va_exit_acc = eval_exit_only(model, exit_module, val_loader, device, layer_idx)
+
+            va_overall_acc = None
+            if report_cascade:
+                out = eval_cascade_multi_exit(
+                    model, val_loader, device,
+                    exit_heads=exit_heads,
+                    exit_cfg_list=payload_exit_cfg,
+                    thrs=_thrs_eval_for_reporting(),
+                    use_prob_margin=use_prob_margin,
+                )
+                va_overall_acc = float(out["overall_acc"])
+
+            print(
+                f"[G1-warmup] layer={layer_idx} exit={exit_id} Ep{epoch:03d} "
+                f"| exit_only_acc={va_exit_acc*100:.2f}%"
+                + (f" | overall@{_thrs_eval_for_reporting()} va={va_overall_acc*100:.2f}%" if va_overall_acc is not None else "")
+            )
+
+            metric = va_exit_acc if best_on == "exit_only_acc" else (va_overall_acc if va_overall_acc is not None else va_exit_acc)
+            if metric > best["val_metric"]:
+                best["val_metric"] = metric
+                best["val_exit_acc"] = va_exit_acc
+                best["val_overall_acc"] = va_overall_acc
+                best["state"] = _snapshot_state()
+
+        # restore best after warmup (stabilize before cotrain)
+        if best["state"] is not None:
+            _restore_state(best["state"])
+
+    # -----------------------
+    # 2) Cotrain: train backbone layer + exit head
+    # -----------------------
+    # re-freeze everything, then unfreeze selected layer + exit
+    set_requires_grad(model, False)
+    for h in exit_heads:
+        set_requires_grad(h, False)
+    if hasattr(model, "classifier"):
+        set_requires_grad(model.classifier, False)
+
+    set_requires_grad(model.layers[layer_idx], True)
+    set_requires_grad(exit_module, True)
+
+    params_layer = [p for p in model.layers[layer_idx].parameters() if p.requires_grad]
+    params_exit = [p for p in exit_module.parameters() if p.requires_grad]
+    assert len(params_layer) > 0, "No trainable params in selected layer (cotrain)"
+    assert len(params_exit) > 0, "No trainable params in selected exit head (cotrain)"
+
+    opt = torch.optim.AdamW(
+        [
+            {"params": params_layer, "lr": lr_layer, "weight_decay": weight_decay},
+            {"params": params_exit,  "lr": lr_exit,  "weight_decay": weight_decay},
+        ]
+    )
+
+    cotrain_epochs = int(max(0, num_epochs))
+    for epoch in range(cotrain_epochs):
+        model.train()
+        exit_module.train()
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(set_to_none=True)
+
+            final_logits, h_list = model.forward_with_all_hidden(xb)
+            h = h_list[layer_idx]
+            exit_logits = _head_logits_from_hidden(exit_module, h, device)
+
+            loss, _, _ = _compute_losses(final_logits, exit_logits, yb)
+            loss.backward()
+
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(params_layer, grad_clip)
+                torch.nn.utils.clip_grad_norm_(params_exit, grad_clip)
+            opt.step()
+
+        # ---- eval ----
+        model.eval()
+        for hmod in exit_heads:
+            hmod.eval()
+
+        va_exit_loss, va_exit_acc = eval_exit_only(model, exit_module, val_loader, device, layer_idx)
+
+        va_overall_acc = None
+        out = None
+        if report_cascade:
+            out = eval_cascade_multi_exit(
+                model, val_loader, device,
+                exit_heads=exit_heads,
+                exit_cfg_list=payload_exit_cfg,
+                thrs=_thrs_eval_for_reporting(),
+                use_prob_margin=use_prob_margin,
+            )
+            va_overall_acc = float(out["overall_acc"])
+
+        print(
+            f"[G1-cotrain] layer={layer_idx} exit={exit_id} Ep{epoch:03d} "
+            f"| exit_only_acc={va_exit_acc*100:.2f}%"
+            + (f" | overall@{_thrs_eval_for_reporting()} va={va_overall_acc*100:.2f}% "
+               f"| exit_rates={out['exit_rates']} final_rate={out['final_rate']:.4f}"
+               if out is not None else "")
+        )
+
+        metric = va_exit_acc if best_on == "exit_only_acc" else (va_overall_acc if va_overall_acc is not None else va_exit_acc)
+        if metric > best["val_metric"]:
+            best["val_metric"] = metric
+            best["val_exit_acc"] = va_exit_acc
+            best["val_overall_acc"] = va_overall_acc
+            best["state"] = _snapshot_state()
+
+    # -----------------------
+    # 3) Restore best
+    # -----------------------
+    if best["state"] is not None:
+        _restore_state(best["state"])
+
+    return model, best
+
+def cotrain_g1_stage_2(
     model,
     train_loader,
     val_loader,
@@ -490,7 +1109,8 @@ def cotrain_g1_stage(
         ]
     )
 
-    best = {"val_overall_acc": -1.0, "state": None}
+    #best = {"val_overall_acc": -1.0, "state": None}
+    best = {"val_metric": -1.0, "state": None}
 
     for epoch in range(num_epochs):
         # ---- train ----
@@ -510,11 +1130,27 @@ def cotrain_g1_stage(
 
             loss_exit  = F.cross_entropy(exit_logits, yb)
 
-            if use_final_loss:
+            '''if use_final_loss:
                 loss_final = F.cross_entropy(final_logits, yb)
                 loss = lambda_final * loss_final + lambda_exit * loss_exit
             else:
-                loss = lambda_exit * loss_exit
+                loss = lambda_exit * loss_exit'''
+            
+            # 讓 logits 不要無限放大
+            loss_scale = 1e-4 * (exit_logits.pow(2).mean())   # 1e-5 ~ 1e-4 sweep
+            loss = lambda_exit * loss_exit + loss_scale
+
+            
+            if use_final_loss:
+                loss_final = F.cross_entropy(final_logits, yb)
+                if exit_id == 1 and epoch < num_epochs // 3:
+                    lam_e, lam_f = 1.0, 0.3
+                else:
+                    lam_e, lam_f = lambda_exit, lambda_final
+                loss = lam_f * loss_final + lam_e * loss_exit
+            else:
+                #loss = lambda_exit * loss_exit
+                loss = lambda_exit * loss_exit + loss_scale
 
             
 
@@ -542,7 +1178,7 @@ def cotrain_g1_stage(
         for h in exit_heads:
             h.eval()
 
-        out = eval_cascade_multi_exit(
+        '''out = eval_cascade_multi_exit(
             model, val_loader, device,
             exit_heads=exit_heads,
             exit_cfg_list=payload_exit_cfg,
@@ -562,7 +1198,45 @@ def cotrain_g1_stage(
             best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             # exits 也要存！不然你只存 backbone 會漏掉 exit head 的更新
             best["exit_states"] = [ {k: v.detach().cpu().clone() for k, v in h.state_dict().items()}
-                                   for h in exit_heads ]
+                                   for h in exit_heads ]'''
+        
+        if exit_id == 1:
+            thrs_eval = (float("inf"), thrs[1])
+        else:
+            thrs_eval = thrs
+        # ---- eval: (1) exit-only metric (for stage-wise selection) ----
+        va_exit_loss, va_exit_acc = eval_exit_only(model, exit_module, val_loader, device, layer_idx)
+
+        # ---- eval: (2) cascade metric (for reporting) ----
+        out = eval_cascade_multi_exit(
+            model, val_loader, device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            thrs=thrs_eval,
+            use_prob_margin=use_prob_margin,
+        )
+        va_overall_acc = float(out["overall_acc"])
+
+        print(
+            f"[G1-stage] layer={layer_idx} exit={exit_id} Ep{epoch:03d} "
+            f"| exit_only_acc={va_exit_acc*100:.2f} "
+            f"| overall@{thrs} va={va_overall_acc*100:.2f} "
+            f"| exit_rates={out['exit_rates']} final_rate={out['final_rate']:.4f}"
+        )
+
+        # ---- choose best: IMPORTANT ----
+        # Stage0 用 overall 也可以；Stage1 必须用 exit-only 才不会把 exit1 饿死
+        '''if exit_id == 0:
+            metric = va_overall_acc
+        else:
+            metric = va_exit_acc'''
+        metric = va_exit_acc
+
+        if metric > best["val_metric"]:
+            best["val_metric"] = metric
+            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best["exit_states"] = [{k: v.detach().cpu().clone() for k, v in h.state_dict().items()}
+                           for h in exit_heads]
 
     # restore best
     if best.get("state") is not None:
@@ -718,7 +1392,7 @@ if __name__ == "__main__":
 
     payload_exit_cfg = [ec.to_payload() for ec in exit_cfg_list]
 
-    model, best0 = cotrain_g1_stage(
+    '''model, best0 = cotrain_g1_stage(
         model=backbone,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -736,7 +1410,8 @@ if __name__ == "__main__":
         payload_exit_cfg=payload_exit_cfg,
         use_prob_margin=False,
     )
-    print("Stage0 best:", best0["val_overall_acc"])
+    #print("Stage0 best:", best0["val_overall_acc"])
+    #print("Stage0 best:", best0["val_metric"])
 
 
     w0_before = {k: v.detach().cpu().clone() for k,v in model.layers[0].state_dict().items()}
@@ -753,16 +1428,99 @@ if __name__ == "__main__":
         lr_layer=3e-4,
         lr_exit=3e-3,
         lambda_exit=0.3,
-        use_final_loss=True,
+        use_final_loss=False,
         thrs=(1.0, 1.5),
         weight_decay=1e-3,
         exit_heads=exit_heads,
         payload_exit_cfg=payload_exit_cfg,
         use_prob_margin=False,
+    )'''
+
+
+    #print("Stage1 best:", best1["val_overall_acc"])
+    #print("Stage1 best:", best1["val_metric"])
+
+    '''# stage0
+    model, best0 = cotrain_g1_stage_v3(
+        model=backbone,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        num_epochs=100,
+        layer_idx=0,
+        exit_id=0,
+        lr_layer=3e-4,
+        lr_exit=3e-3,
+        lambda_exit=1.0,
+        label_smoothing=0.0,
+        thrs=(1.0, 1.5),
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
     )
 
+    # stage1
+    model, best1 = cotrain_g1_stage_v3(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        num_epochs=100,
+        layer_idx=1,
+        exit_id=1,
+        lr_layer=3e-4,
+        lr_exit=3e-3,
+        lambda_exit=1.0,
+        label_smoothing=0.0,
+        thrs=(1.0, 1.5),
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+    )'''
+    model, best0 = cotrain_g1_stage_v3(
+        model=backbone, train_loader=train_loader, val_loader=val_loader, device=device,
+        num_epochs=60, layer_idx=0, exit_id=0,
+        lr_layer=3e-4, lr_exit=3e-3,
+        lambda_exit=1.0,
+        use_final_loss=False,
+        thrs=(1.0, 1.5),
+        weight_decay=1e-3,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        enable_soft_residual=False,   # ✅ stage0 不用
+    )
+    print("Stage0 best metric:", best0["val_metric"])
 
-    print("Stage1 best:", best1["val_overall_acc"])
+
+    model, best1 = cotrain_g1_stage_v3(
+        model=model, train_loader=train_loader, val_loader=val_loader, device=device,
+        num_epochs=60, layer_idx=1, exit_id=1,
+        lr_layer=3e-4, lr_exit=3e-3,
+        lambda_exit=1.0,
+        #use_final_loss=False,
+        thrs=(1.0, 1.5),
+        weight_decay=1e-3,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        enable_soft_residual=True,     # ✅ stage1 打開
+        target_exit0_rate=0.70,        # exit0 約接走 70%
+        gate_temp0=30.0,               # 你的 margin 很大，這個很重要
+
+        use_final_loss=True,
+        lambda_final=0.1,
+    )
+    print("Stage1 best metric:", best1["val_metric"])
+
+
+
+    def max_abs_diff(sd0, sd1):
+        m = 0.0
+        for k in sd0.keys():
+            m = max(m, (sd0[k] - sd1[k].cpu()).abs().max().item())
+        return m
+
+    '''d0 = max_abs_diff(w0_before, model.layers[0].state_dict())
+    d1 = max_abs_diff(w_exit0_before, exit_heads[0].state_dict())
+    print("delta layer0:", d0, "delta exit0:", d1)
+    assert d0 < 1e-9 and d1 < 1e-9'''
 
 
 
@@ -800,8 +1558,8 @@ if __name__ == "__main__":
         print_eval_profile(f"G1-v2 exit0@thr={thr}", out)
     
     print('=======================================')
-    thrs0 = [0.5, 1.0, 1.5]
-    thrs1 = [1.5, 2.0, 2.5]
+    thrs0 = [0.5, 1.0, 1.5, math.inf]
+    thrs1 = [1.5, 2.0, 2.5, math.inf]
 
     for thr0 in thrs0:
         for thr1 in thrs1:
@@ -842,5 +1600,62 @@ if __name__ == "__main__":
             print_eval_profile(f"G1-v2 cascade@({thr0},{thr1})", out)
 
 
+    print('=======================================')
+    best, dbg = sweep_cascade_by_quantile(
+        model=backbone,
+        val_loader=val_loader,
+        device=device,
+        exit_heads=exit_heads,
+        exit_cfg_list=payload_exit_cfg
+    )
+
+
+    @torch.no_grad()
+    def debug_logit_scales(model, loader, device, exit_heads, payload_exit_cfg, use_prob_margin=False, n_batches=3):
+        model.eval()
+        for h in exit_heads:
+            h.eval()
+
+        for bi, (xb, yb) in enumerate(loader):
+            if bi >= n_batches:
+                break
+            xb, yb = xb.to(device), yb.to(device)
+
+            final_logits, h_list = model.forward_with_all_hidden(xb)
+
+            # ---- final logits stats ----
+            print("[final] abs mean/max:",
+                final_logits.abs().mean().item(),
+                final_logits.abs().max().item())
+
+            # ---- each exit logits stats ----
+            for i, head in enumerate(exit_heads):
+                layer_idx = int(payload_exit_cfg[i]["layer_idx"])
+                h_i = h_list[layer_idx]
+
+                # head logits (你原本就有這個 helper；沒有就 head(h_i))
+                exit_logits = _head_logits_from_hidden(head, h_i, device)  # [B,C]
+
+                # margin on logits (same as your cascade gate)
+                top2 = torch.topk(exit_logits, k=2, dim=-1).values
+                margin = top2[:, 0] - top2[:, 1]
+
+                print(f"[exit{i}] abs mean/max:",
+                    exit_logits.abs().mean().item(),
+                    exit_logits.abs().max().item(),
+                    "| margin mean/p95:",
+                    margin.mean().item(),
+                    torch.quantile(margin, 0.95).item())
+                
+
+    debug_logit_scales(
+        model=backbone,
+        loader=test_loader,
+        device=device,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        use_prob_margin=False,
+        n_batches=5,
+    )
 
    

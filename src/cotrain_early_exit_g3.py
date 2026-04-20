@@ -448,15 +448,19 @@ def train_g3(
 
     for ep in range(cfg.num_epochs):
         lam = lambda_schedule_linear(ep, warmup=cfg.lambda_warmup, final_lambda=cfg.final_lambda_exit)
-        #lam = 0.1
         model.train()
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            final_logits, exit1_logits = model.forward_g3(xb)
+            # Match the training objective to the deployment-time gate:
+            # the final branch should mainly improve samples that will not exit early.
+            final_logits, exit1_logits, exit_mask = model.forward_g2_with_mask(xb, thr=cfg.thr_eval)
 
-            loss_final = F.cross_entropy(final_logits, yb)
+            if (~exit_mask).any():
+                loss_final = F.cross_entropy(final_logits[~exit_mask], yb[~exit_mask])
+            else:
+                loss_final = torch.zeros([], device=xb.device)
             loss_exit  = F.cross_entropy(exit1_logits, yb)
             loss = loss_final + lam * loss_exit
 
@@ -663,18 +667,18 @@ if __name__ == "__main__":
     test_loader   = DataLoader(test_ds, batch_size=512, shuffle=False)'''
 
 
-    model, bb_cfg, ex_cfg, _ = load_ckpt("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_w_exit_g1_v1.pth", device)
+    model, bb_cfg, ex_cfg, _ = load_ckpt("/Users/yi-chunchen/workspace/WNN_early_exit/model/wnn_w_exit_g2_v1.pth", device)
     
     for p in model.parameters():
         print(p.shape, p.requires_grad)
 
     # baseline
     exit_loss, exit_acc = eval_exit1_epoch(model, test_loader, device)
-    print(f"[G0 Exit head only] test_acc={exit_acc*100:.2f}%")
+    print(f"[G2 Exit head only] test_acc={exit_acc*100:.2f}%")
     final_acc = eval_final_acc(model, test_loader, device)
-    print(f"[G0 Final head only] test_acc={final_acc*100:.2f}%")
+    print(f"[G2 Final head only] test_acc={final_acc*100:.2f}%")
     m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
-    print(f"[G0 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
+    print(f"[G2 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
 
     
     # G3: joint finetune with lambda schedule

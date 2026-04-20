@@ -20,9 +20,11 @@ class WNNLUTLayer(nn.Module):
         lut_input_size: int = 6,
         mapping=None,
         conn_idx=None,
+        random_seed=None,
         init_std: float = 0.01,
         dropout_p = 0.2,
-        binarize_input = True
+        binarize_input = True,
+        tau: float = 1.0,
     ):
         super().__init__()
 
@@ -31,6 +33,7 @@ class WNNLUTLayer(nn.Module):
         self.lut_input_size = lut_input_size
         self.dropout = nn.Dropout(p=dropout_p)
         self.binarize_input = binarize_input
+        self.tau = tau
 
         # -----------------------------
         # 1) Decide connection indices
@@ -51,11 +54,16 @@ class WNNLUTLayer(nn.Module):
             else:
                 conn = mapping.clone().long()
         else:
+            generator = None
+            if random_seed is not None:
+                generator = torch.Generator()
+                generator.manual_seed(int(random_seed))
             conn = torch.randint(
                 low=0,
                 high=in_bits,
                 size=(num_luts, lut_input_size),
                 dtype=torch.long,
+                generator=generator,
             )
 
         # Validate shape
@@ -102,6 +110,7 @@ class WNNLUTLayer(nn.Module):
         out = torch.gather(table_expanded, 2, idx.unsqueeze(-1)).squeeze(-1)
 
         # sigmoid activation (same as PyTorch version   )
-        out = torch.sigmoid(out)
+        #out = out/self.tau
+        out = torch.sigmoid(out/self.tau)
         out = self.dropout(out)
         return out

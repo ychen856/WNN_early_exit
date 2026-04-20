@@ -39,6 +39,21 @@ class DatasetMeta:
     val_ratio: float
 
 
+def _apply_train_augmentation(x_u8: torch.Tensor, seed: int) -> torch.Tensor:
+    aug = T.Compose([
+        T.RandomCrop(28, padding=2),
+        #T.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+    ])
+
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        x_float = x_u8.unsqueeze(1).float() / 255.0
+        x_aug = torch.stack([aug(img) for img in x_float], dim=0)
+
+    x_aug = (x_aug.squeeze(1) * 255.0).round().clamp(0, 255).to(torch.uint8)
+    return x_aug
+
+
 def _load_torchvision_grayscale_dataset(name: str, root: str):
     """
     Returns:
@@ -81,6 +96,7 @@ def build_loaders_bits(
     z: int = 32,
     device_for_encoding: Optional[torch.device] = None,
     shuffle_train: bool = False,
+    use_augmentation: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, int, int, DatasetMeta]:
     """
     Build dataloaders of *bit-encoded* inputs.
@@ -113,6 +129,9 @@ def build_loaders_bits(
     y_train = full_ds.tensors[1][train_ds.indices]
     x_val_u8 = full_ds.tensors[0][val_ds.indices]
     y_val = full_ds.tensors[1][val_ds.indices]
+
+    if use_augmentation:
+        x_train_u8 = _apply_train_augmentation(x_train_u8, seed=seed)
 
     # ---------- DT thresholds computed on TRAIN (float) ----------
     # Keep on CPU for stats then encode on device_for_encoding if provided.
