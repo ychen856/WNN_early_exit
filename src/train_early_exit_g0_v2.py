@@ -497,7 +497,7 @@ if __name__ == "__main__":
         print_eval_profile(f"G0-v2 exit0@thr={thr}", out)
     
     print('=======================================')
-    thrs0 = [0.5, 1.0, 1.5, math.inf]
+    '''thrs0 = [0.5, 1.0, 1.5, math.inf]
     thrs1 = [1.5, 2.0, 2.5, math.inf]
 
     for thr0 in thrs0:
@@ -511,10 +511,6 @@ if __name__ == "__main__":
                 )
             s = sum(out["exit_rates"]) + out["final_rate"]
             assert abs(s - 1.0) < 1e-6, s
-            '''print(thr0, thr1,
-                out["overall_acc"], out["exit_rates"], out["final_rate"],
-                out["exit_accs"],
-                out["final_acc"])'''
 
             r0, r1 = out["exit_rates"]
             rF = out["final_rate"]
@@ -522,11 +518,6 @@ if __name__ == "__main__":
             exp_layers = 1*r0 + 2*r1 + 3*rF
             compute_ratio = exp_layers / 3.0
 
-            '''print(thr0, thr1,
-                out["overall_acc"],
-                out["exit_rates"], out["final_rate"],
-                "E_layers", round(exp_layers, 4),
-                "compute", round(compute_ratio, 4))'''
 
             print(thr0, thr1, out)
-            print_eval_profile(f"G0-v2 cascade@({thr0},{thr1})", out)
+            print_eval_profile(f"G0-v2 cascade@({thr0},{thr1})", out)'''

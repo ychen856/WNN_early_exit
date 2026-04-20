@@ -1375,6 +1375,8 @@ if __name__ == "__main__":
     test_loss, test_acc = eval_epoch(backbone, test_loader, device)
     print("[final-only] test_acc", test_acc)
     # 之後直接用 backbone + exit_heads + exit_cfg_list 做 cascade eval / g1 training
+
+    # comment out because it's a hard code sanity check
     out = eval_cascade_multi_exit(
         backbone, test_loader, device,
         exit_heads=exit_heads,
@@ -1557,7 +1559,7 @@ if __name__ == "__main__":
               out["margin_mean"], out["margin_p95"])
         print_eval_profile(f"G1-v2 exit0@thr={thr}", out)
     
-    print('=======================================')
+    '''print('=======================================')
     thrs0 = [0.5, 1.0, 1.5, math.inf]
     thrs1 = [1.5, 2.0, 2.5, math.inf]
 
@@ -1572,10 +1574,6 @@ if __name__ == "__main__":
                 )
             s = sum(out["exit_rates"]) + out["final_rate"]
             assert abs(s - 1.0) < 1e-6, s
-            '''print(thr0, thr1,
-                out["overall_acc"], out["exit_rates"], out["final_rate"],
-                out["exit_accs"],
-                out["final_acc"])'''
 
             r0, r1 = out["exit_rates"]
             rF = out["final_rate"]
@@ -1597,7 +1595,7 @@ if __name__ == "__main__":
             m1_detail = out['margin_stats'][3]
             print(f" | m0_undecided={m0_detail['undecided_mean']:.2f} m0_undecided_p95={m0_detail['undecided_p95']:.2f} m0_taken_mean={m0_detail['taken_mean']:.2f} m0_taken_p95={m0_detail['taken_p95']:.2f}")
             print(f" | m1_undecided={m1_detail['undecided_mean']:.2f} m1_undecided_p95={m1_detail['undecided_p95']:.2f} m1_taken_mean={m1_detail['taken_mean']:.2f} m1_taken_p95={m1_detail['taken_p95']:.2f}")
-            print_eval_profile(f"G1-v2 cascade@({thr0},{thr1})", out)
+            print_eval_profile(f"G1-v2 cascade@({thr0},{thr1})", out)'''
 
 
     print('=======================================')
