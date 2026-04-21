@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Quasi-Weightless Transformers (QuWeiT) Training - Enhanced Version
 # Combines QuWeiT methodology with robust training infrastructure
 # Paper: "Shrinking the Giant: Quasi-Weightless Transformers for Low Energy Inference"
