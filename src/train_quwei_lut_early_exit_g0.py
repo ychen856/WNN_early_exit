@@ -12,7 +12,12 @@ from torchvision import datasets
 from src.core.linearExitHead import ExitHead as LinearExitHead
 from src.core.multiLayerWNN import save_ckpt_v2
 from src.exit.ckpt_exit import ExitConfig
-from src.train_quweit_lut_backbone_v2 import QuWeiTViT, ResizeWithCIFARStats, TrainConfig
+from src.train_quweit_lut_backbone_v2 import (
+    QuWeiTViT,
+    ResizeWithCIFARStats,
+    TrainConfig,
+    get_model_profile,
+)
 
 
 def _parse_csv(s: str, cast=float) -> List:
@@ -154,11 +159,25 @@ def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, u
     return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
 
 
-def train_one_exit_cached(head, x_train, y_train, x_val, y_val, device, *, epochs=20, lr=3e-3, wd=1e-4, batch_size=512):
+def train_one_exit_cached(
+    head,
+    x_train,
+    y_train,
+    x_val,
+    y_val,
+    device,
+    *,
+    epochs=20,
+    lr=3e-3,
+    wd=1e-4,
+    batch_size=512,
+    patience=15,
+):
     head = head.to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=wd)
     best_state = None
     best_val_acc = -1.0
+    epochs_since_improve = 0
     n = x_train.size(0)
 
     for epoch in range(epochs):
@@ -197,6 +216,15 @@ def train_one_exit_cached(head, x_train, y_train, x_val, y_val, device, *, epoch
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_state = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+            if epochs_since_improve >= patience:
+                print(
+                    f"[exit-train] early stop at epoch={epoch:03d} "
+                    f"(no val_acc improvement for {patience} epochs)"
+                )
+                break
 
     if best_state is not None:
         head.load_state_dict(best_state)
@@ -217,12 +245,55 @@ def evaluate_cached_exit_head(head, x, y, device):
     }
 
 
+def _count_parameters(module) -> int:
+    return sum(p.numel() for p in module.parameters()) if module is not None else 0
+
+
+def _linear_flops_and_macs(linear: torch.nn.Linear):
+    macs = float(linear.in_features * linear.out_features)
+    bias_flops = float(linear.out_features if linear.bias is not None else 0.0)
+    flops = 2.0 * macs + bias_flops
+    return flops, macs
+
+
+def get_external_exit_profile(model: QuWeiTViT, exit_heads: List[torch.nn.Module], exit_cfg_list: List[dict]):
+    profile = get_model_profile(model)
+    exit_profiles = []
+    total_exit_head_params = 0
+
+    for head, cfg in zip(exit_heads, exit_cfg_list):
+        cls_flops, cls_macs = _linear_flops_and_macs(head.classifier)
+        norm_flops = float(2 * head.k) if getattr(head, "use_norm", False) else 0.0
+        head_flops = norm_flops + cls_flops
+        head_macs = cls_macs
+        head_params = _count_parameters(head)
+        total_exit_head_params += head_params
+        exit_profiles.append(
+            {
+                "layer_idx": int(cfg["layer_idx"]),
+                "flops": head_flops,
+                "macs": head_macs,
+                "params": head_params,
+            }
+        )
+
+    profile["exit_heads"] = exit_profiles
+    profile["total_exit_head_params"] = float(total_exit_head_params)
+    profile["param_overhead_ratio"] = (
+        float(total_exit_head_params) / float(profile["backbone_params"])
+        if float(profile["backbone_params"]) > 0 else float("nan")
+    )
+    return profile
+
+
 @torch.no_grad()
 def eval_overall_at_thr(model, loader, device, thr: float, *, exit_id: int, exit_cfg_list: List[dict], exit_heads: List[torch.nn.Module]):
+    profile = get_external_exit_profile(model, exit_heads, exit_cfg_list)
     cfg = exit_cfg_list[exit_id]
     layer_idx = int(cfg["layer_idx"])
     exit_tau = float(cfg.get("exit_tau", 1.0))
     head = exit_heads[exit_id].to(device).eval()
+    exit_profile = profile["exit_heads"][exit_id]
 
     total = 0
     correct_overall = 0
@@ -231,6 +302,9 @@ def eval_overall_at_thr(model, loader, device, thr: float, *, exit_id: int, exit
     non_exited = 0
     correct_non_exited = 0
     margins = []
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
 
     model.eval()
     for xb, yb in loader:
@@ -257,7 +331,23 @@ def eval_overall_at_thr(model, loader, device, thr: float, *, exit_id: int, exit
             non_exited += int((~exit_mask).sum().item())
             correct_non_exited += (final_logits.argmax(dim=-1)[~exit_mask] == yb[~exit_mask]).sum().item()
 
+        batch_size = yb.numel()
+        exited_batch = float(exit_mask.sum().item())
+        non_exited_batch = float(batch_size - exited_batch)
+        prefix_flops = profile["patch_embed"]["flops"] + sum(layer["flops"] for layer in profile["layers"][:layer_idx])
+        prefix_macs = profile["patch_embed"]["macs"] + sum(layer["macs"] for layer in profile["layers"][:layer_idx])
+        tail_flops = sum(layer["flops"] for layer in profile["layers"][layer_idx:]) + profile["final_head"]["flops"]
+        tail_macs = sum(layer["macs"] for layer in profile["layers"][layer_idx:]) + profile["final_head"]["macs"]
+        total_flops += batch_size * (prefix_flops + exit_profile["flops"]) + non_exited_batch * tail_flops
+        total_macs += batch_size * (prefix_macs + exit_profile["macs"]) + non_exited_batch * tail_macs
+        total_layers += batch_size * float(layer_idx) + non_exited_batch * float(profile["num_backbone_layers"] - layer_idx)
+
     margins = torch.cat(margins, dim=0)
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
     return {
         "overall_acc": correct_overall / max(total, 1),
         "exit_rate": exited / max(total, 1),
@@ -268,11 +358,20 @@ def eval_overall_at_thr(model, loader, device, thr: float, *, exit_id: int, exit
         "exited": exited,
         "non_exited": non_exited,
         "total": total,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan"),
     }
 
 
 @torch.no_grad()
 def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], exit_cfg_list: List[dict], thrs: List[float]):
+    profile = get_external_exit_profile(model, exit_heads, exit_cfg_list)
     total = 0
     correct = 0
     num_exits = len(exit_heads)
@@ -281,6 +380,9 @@ def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], ex
     n_final = 0
     c_final = 0
     margin_stats = []
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
 
     model.eval()
     for h in exit_heads:
@@ -323,6 +425,39 @@ def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], ex
         correct += (preds == yb).sum().item()
         total += bsz
 
+        route_taken = torch.full((bsz,), fill_value=num_exits, dtype=torch.long, device=device)
+        undecided = torch.ones(bsz, dtype=torch.bool, device=device)
+        for i in range(num_exits):
+            cfg = exit_cfg_list[i]
+            head = exit_heads[i].to(device)
+            logits_i = head(h_list[int(cfg["layer_idx"]) - 1]) / float(cfg.get("exit_tau", 1.0))
+            top2 = torch.topk(logits_i, k=2, dim=-1).values
+            margins = top2[:, 0] - top2[:, 1]
+            take_i = undecided & (margins > float(thrs[i]))
+            route_taken[take_i] = i
+            undecided = undecided & (~take_i)
+
+        for route in range(num_exits):
+            count = float((route_taken == route).sum().item())
+            if count == 0:
+                continue
+            layer_idx = int(profile["exit_heads"][route]["layer_idx"])
+            flops = profile["patch_embed"]["flops"] + sum(layer["flops"] for layer in profile["layers"][:layer_idx])
+            macs = profile["patch_embed"]["macs"] + sum(layer["macs"] for layer in profile["layers"][:layer_idx])
+            flops += sum(h["flops"] for h in profile["exit_heads"][: route + 1])
+            macs += sum(h["macs"] for h in profile["exit_heads"][: route + 1])
+            total_flops += count * flops
+            total_macs += count * macs
+            total_layers += count * float(layer_idx)
+
+        final_count = float((route_taken == num_exits).sum().item())
+        if final_count > 0:
+            final_route_flops = profile["backbone_full_flops"] + sum(h["flops"] for h in profile["exit_heads"])
+            final_route_macs = profile["backbone_full_macs"] + sum(h["macs"] for h in profile["exit_heads"])
+            total_flops += final_count * final_route_flops
+            total_macs += final_count * final_route_macs
+            total_layers += final_count * float(profile["num_backbone_layers"])
+
     for i in range(num_exits):
         mu_u = float(torch.cat(all_undecided[i]).mean().item()) if all_undecided[i] else float("nan")
         p95_u = float(torch.quantile(torch.cat(all_undecided[i]), 0.95).item()) if all_undecided[i] else float("nan")
@@ -335,6 +470,12 @@ def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], ex
             "taken_p95": p95_t,
         })
 
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+
     return {
         "overall_acc": correct / max(total, 1),
         "total": total,
@@ -343,12 +484,23 @@ def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], ex
         "final_rate": n_final / max(total, 1),
         "final_acc": (c_final / n_final) if n_final > 0 else float("nan"),
         "margin_stats": margin_stats,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan"),
     }
 
 
 def print_single_exit_sweep(title: str, rows: List[dict]):
     print(f"\n=== {title} ===")
-    header = "thr    exit%   overall%  exit_acc%  non_exit_acc%  m_mean  m_p95  exited non_exited total"
+    header = (
+        "thr    exit%   overall%  exit_acc%  non_exit_acc%  m_mean  m_p95  "
+        "avgFLOPs   avgMACs avgLayers bbParams exitParams overhead"
+    )
     print(header)
     print("-" * len(header))
     for row in rows:
@@ -361,9 +513,12 @@ def print_single_exit_sweep(title: str, rows: List[dict]):
             f"{non_exit_acc:>13.2f}  "
             f"{row['margin_mean']:>6.2f}  "
             f"{row['margin_p95']:>6.2f}  "
-            f"{row['exited']:>6d}  "
-            f"{row['non_exited']:>10d} "
-            f"{row['total']:>5d}"
+            f"{row['avg_flops_per_sample']:>9.0f} "
+            f"{row['avg_macs_per_sample']:>9.0f} "
+            f"{row['avg_layers_executed_per_sample']:>9.3f} "
+            f"{int(row['backbone_params']):>8d} "
+            f"{int(row['total_exit_head_params']):>10d} "
+            f"{row['compute_overhead_ratio']:>8.4f}"
         )
 
 
@@ -381,6 +536,12 @@ def print_cascade_sweep(title: str, rows: List[dict]):
             f"final_rate={row['final_rate'] * 100:.2f}% "
             f"exit_accs=[{exit_acc_text}] "
             f"final_acc={final_acc:.2f}% "
+            f"avgFLOPs={row['avg_flops_per_sample']:.0f} "
+            f"avgMACs={row['avg_macs_per_sample']:.0f} "
+            f"avgLayers={row['avg_layers_executed_per_sample']:.3f} "
+            f"bbParams={int(row['backbone_params'])} "
+            f"exitParams={int(row['total_exit_head_params'])} "
+            f"overhead={row['compute_overhead_ratio']:.4f} "
             f"margin_stats={row['margin_stats']}"
         )
 
@@ -404,6 +565,7 @@ def main():
     parser.add_argument("--batch_size_train", type=int, default=128)
     parser.add_argument("--batch_size_eval", type=int, default=256)
     parser.add_argument("--batch_size_cached", type=int, default=512)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -473,6 +635,7 @@ def main():
             lr=args.lr,
             wd=args.weight_decay,
             batch_size=args.batch_size_cached,
+            patience=args.patience,
         )
 
         val_metrics = evaluate_cached_exit_head(head, x_val, y_val, device)

@@ -122,6 +122,79 @@ class AverageMeter:
         self.avg = self.sum / max(self.count, 1)
 
 
+def _count_parameters(module: Optional[nn.Module]) -> int:
+    if module is None:
+        return 0
+    return sum(p.numel() for p in module.parameters())
+
+
+def _linear_flops_and_macs(linear: Optional[nn.Linear], num_tokens: int = 1) -> Tuple[float, float]:
+    if linear is None:
+        return 0.0, 0.0
+    macs = float(num_tokens * linear.in_features * linear.out_features)
+    bias_flops = float(num_tokens * linear.out_features if linear.bias is not None else 0.0)
+    flops = 2.0 * macs + bias_flops
+    return flops, macs
+
+
+def _conv2d_flops_and_macs(conv: Optional[nn.Conv2d], out_h: int, out_w: int) -> Tuple[float, float]:
+    if conv is None:
+        return 0.0, 0.0
+    kernel_mul = conv.kernel_size[0] * conv.kernel_size[1] * (conv.in_channels // conv.groups)
+    macs = float(out_h * out_w * conv.out_channels * kernel_mul)
+    bias_flops = float(out_h * out_w * conv.out_channels if conv.bias is not None else 0.0)
+    flops = 2.0 * macs + bias_flops
+    return flops, macs
+
+
+def _layernorm_flops(num_tokens: int, dim: int) -> float:
+    return float(5 * num_tokens * dim)
+
+
+def _attention_flops_and_macs(attn: Attention, num_tokens: int, dim: int) -> Tuple[float, float]:
+    qkv_flops, qkv_macs = _linear_flops_and_macs(attn.qkv, num_tokens=num_tokens)
+    proj_flops, proj_macs = _linear_flops_and_macs(attn.proj, num_tokens=num_tokens)
+    qk_macs = float(num_tokens * num_tokens * dim)
+    av_macs = float(num_tokens * num_tokens * dim)
+    attn_macs = qk_macs + av_macs
+    attn_flops = 2.0 * attn_macs
+    return qkv_flops + proj_flops + attn_flops, qkv_macs + proj_macs + attn_macs
+
+
+def _dense_mlp_flops_and_macs(mlp: DenseMLP, num_tokens: int) -> Tuple[float, float]:
+    fc1_flops, fc1_macs = _linear_flops_and_macs(mlp.fc1, num_tokens=num_tokens)
+    fc2_flops, fc2_macs = _linear_flops_and_macs(mlp.fc2, num_tokens=num_tokens)
+    act_flops = float(4 * num_tokens * mlp.fc1.out_features)
+    return fc1_flops + fc2_flops + act_flops, fc1_macs + fc2_macs
+
+
+def _weightless_block_flops_and_macs(block: WeightlessBlock, num_tokens: int, dim: int) -> Tuple[float, float]:
+    bins = int(block.encoder1.num_bins)
+    hidden_dim = int(block.proj.in_features)
+    encode_flops = float(num_tokens * dim * bins * 6)
+    lut_macs = float(num_tokens * hidden_dim * dim * bins)
+    lut_flops = 2.0 * lut_macs + float(num_tokens * hidden_dim)
+    proj_flops, proj_macs = _linear_flops_and_macs(block.proj, num_tokens=num_tokens)
+    cond_sum_flops = float(num_tokens * dim)
+    act_flops = float(num_tokens * hidden_dim)
+    return encode_flops + lut_flops + proj_flops + cond_sum_flops + act_flops, lut_macs + proj_macs
+
+
+def _encoder_block_flops_and_macs(block: EncoderBlock, num_tokens: int, dim: int) -> Tuple[float, float]:
+    flops = 2.0 * _layernorm_flops(num_tokens, dim)
+    macs = 0.0
+    attn_flops, attn_macs = _attention_flops_and_macs(block.attn, num_tokens, dim)
+    flops += attn_flops
+    macs += attn_macs
+    if isinstance(block.mlp_or_weightless, DenseMLP):
+        mlp_flops, mlp_macs = _dense_mlp_flops_and_macs(block.mlp_or_weightless, num_tokens)
+    else:
+        mlp_flops, mlp_macs = _weightless_block_flops_and_macs(block.mlp_or_weightless, num_tokens, dim)
+    flops += mlp_flops
+    macs += mlp_macs
+    return flops, macs
+
+
 class ResizeWithCIFARStats:
     """Validation preprocessing for CIFAR resized to ViT input size."""
 
@@ -486,6 +559,85 @@ class QuWeiTViT(nn.Module):
         }
 
 
+def get_model_profile(model: QuWeiTViT) -> Dict[str, object]:
+    num_tokens = model.patch_embed.num_patches + 1
+    dim = model.cfg.embed_dim
+    grid_size = model.patch_embed.grid_size
+
+    patch_flops, patch_macs = _conv2d_flops_and_macs(model.patch_embed.proj, grid_size, grid_size)
+    layer_profiles = []
+    backbone_flops = patch_flops
+    backbone_macs = patch_macs
+
+    for block in model.blocks:
+        layer_flops, layer_macs = _encoder_block_flops_and_macs(block, num_tokens, dim)
+        layer_profiles.append({"flops": layer_flops, "macs": layer_macs})
+        backbone_flops += layer_flops
+        backbone_macs += layer_macs
+
+    final_norm_flops = _layernorm_flops(1, dim)
+    final_head_flops, final_head_macs = _linear_flops_and_macs(model.head, num_tokens=1)
+    backbone_flops += final_norm_flops + final_head_flops
+    backbone_macs += final_head_macs
+
+    exit_profiles = []
+    total_exit_head_params = 0
+    total_exit_full_flops = 0.0
+    total_exit_full_macs = 0.0
+    for layer_id in model.exit_layers:
+        head = model.exit_heads[str(layer_id)]
+        head_flops = _layernorm_flops(1, dim)
+        fc_flops, fc_macs = _linear_flops_and_macs(head.fc, num_tokens=1)
+        head_flops += fc_flops
+        head_macs = fc_macs
+        head_params = _count_parameters(head)
+        total_exit_head_params += head_params
+        total_exit_full_flops += head_flops
+        total_exit_full_macs += head_macs
+        exit_profiles.append(
+            {
+                "layer_id": int(layer_id),
+                "flops": head_flops,
+                "macs": head_macs,
+                "params": head_params,
+            }
+        )
+
+    backbone_params = _count_parameters(model) - total_exit_head_params
+    param_overhead_ratio = (
+        total_exit_head_params / backbone_params if backbone_params > 0 else float("nan")
+    )
+
+    return {
+        "num_backbone_layers": len(model.blocks),
+        "patch_embed": {"flops": patch_flops, "macs": patch_macs},
+        "layers": layer_profiles,
+        "final_head": {"flops": final_norm_flops + final_head_flops, "macs": final_head_macs},
+        "backbone_full_flops": backbone_flops,
+        "backbone_full_macs": backbone_macs,
+        "backbone_params": backbone_params,
+        "exit_heads": exit_profiles,
+        "total_exit_head_params": total_exit_head_params,
+        "param_overhead_ratio": param_overhead_ratio,
+        "full_model_flops_with_all_exits": backbone_flops + total_exit_full_flops,
+        "full_model_macs_with_all_exits": backbone_macs + total_exit_full_macs,
+    }
+
+
+def print_eval_profile(tag: str, metrics: Dict[str, float]) -> None:
+    if "avg_flops_per_sample" not in metrics:
+        return
+    print(
+        f"[{tag} Profile] "
+        f"avg_flops/sample={metrics['avg_flops_per_sample']:.2f} | "
+        f"avg_macs/sample={metrics['avg_macs_per_sample']:.2f} | "
+        f"avg_layers/sample={metrics['avg_layers_executed_per_sample']:.4f} | "
+        f"backbone_params={int(metrics['backbone_params'])} | "
+        f"exit_head_params={int(metrics['total_exit_head_params'])} | "
+        f"calculated_overhead={metrics['compute_overhead_ratio']:.6f}"
+    )
+
+
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     num_epochs: int,
@@ -707,8 +859,13 @@ def evaluate(model, loader, criterion, device, cfg: Optional[TrainConfig] = None
     acc1_meter = AverageMeter()
     acc5_meter = AverageMeter()
 
+    profile = get_model_profile(model)
+    exit_profile_by_layer = {item["layer_id"]: item for item in profile["exit_heads"]}
     exit_stats = {}
     total_samples = 0
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
 
     model.eval()
     for images, targets in loader:
@@ -723,18 +880,64 @@ def evaluate(model, loader, criterion, device, cfg: Optional[TrainConfig] = None
         loss_meter.update(loss.item(), images.size(0))
         acc1_meter.update(acc1.item(), images.size(0))
         acc5_meter.update(acc5.item(), images.size(0))
+        batch_size = images.size(0)
 
         if cfg is not None and cfg.use_exit:
             ee = model.forward_early_exit(images)
             exit_layer = int(ee["exit_layer"])
-            exit_stats[exit_layer] = exit_stats.get(exit_layer, 0) + images.size(0)
-            total_samples += images.size(0)
+            exit_stats[exit_layer] = exit_stats.get(exit_layer, 0) + batch_size
+            total_samples += batch_size
+
+            prefix_flops = profile["patch_embed"]["flops"] + sum(
+                layer["flops"] for layer in profile["layers"][:exit_layer]
+            )
+            prefix_macs = profile["patch_embed"]["macs"] + sum(
+                layer["macs"] for layer in profile["layers"][:exit_layer]
+            )
+            exit_head_flops = 0.0
+            exit_head_macs = 0.0
+            for layer_id in model.exit_layers:
+                if layer_id > exit_layer:
+                    break
+                exit_head_info = exit_profile_by_layer[int(layer_id)]
+                exit_head_flops += exit_head_info["flops"]
+                exit_head_macs += exit_head_info["macs"]
+
+            if exit_layer == model.cfg.depth:
+                sample_flops = prefix_flops + profile["final_head"]["flops"] + exit_head_flops
+                sample_macs = prefix_macs + profile["final_head"]["macs"] + exit_head_macs
+            else:
+                sample_flops = prefix_flops + exit_head_flops
+                sample_macs = prefix_macs + exit_head_macs
+
+            total_flops += batch_size * sample_flops
+            total_macs += batch_size * sample_macs
+            total_layers += batch_size * float(exit_layer)
+        else:
+            total_samples += batch_size
+            total_flops += batch_size * float(profile["backbone_full_flops"])
+            total_macs += batch_size * float(profile["backbone_full_macs"])
+            total_layers += batch_size * float(profile["num_backbone_layers"])
 
     metrics = {
         "loss": loss_meter.avg,
         "acc1": acc1_meter.avg,
         "acc5": acc5_meter.avg,
+        "avg_flops_per_sample": total_flops / max(total_samples, 1),
+        "avg_macs_per_sample": total_macs / max(total_samples, 1),
+        "avg_layers_executed_per_sample": total_layers / max(total_samples, 1),
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": (
+            total_flops / max(total_samples, 1) / float(profile["backbone_full_flops"])
+            if profile["backbone_full_flops"] > 0 else float("nan")
+        ),
     }
+    metrics["compute_saving_ratio"] = (
+        1.0 - metrics["compute_overhead_ratio"]
+        if metrics["compute_overhead_ratio"] == metrics["compute_overhead_ratio"] else float("nan")
+    )
     if total_samples > 0:
         metrics["exit_ratio"] = {k: v / total_samples for k, v in sorted(exit_stats.items())}
     return metrics
@@ -1042,6 +1245,7 @@ def main():
         print(
             f"[Eval] loss={metrics['loss']:.4f} acc1={metrics['acc1']:.2f} acc5={metrics['acc5']:.2f}"
         )
+        print_eval_profile("Eval", metrics)
         if "exit_ratio" in metrics:
             print(f"[Eval] exit_ratio={metrics['exit_ratio']}")
         clean_metrics = evaluate(model, clean_train_loader, val_criterion, device, cfg)
@@ -1049,12 +1253,14 @@ def main():
             f"[Train-Clean] loss={clean_metrics['loss']:.4f} "
             f"acc1={clean_metrics['acc1']:.2f} acc5={clean_metrics['acc5']:.2f}"
         )
+        print_eval_profile("Train-Clean", clean_metrics)
         if model_ema is not None:
             ema_metrics = evaluate(model_ema.module, val_loader, val_criterion, device, cfg)
             print(
                 f"[EMA Eval] loss={ema_metrics['loss']:.4f} "
                 f"acc1={ema_metrics['acc1']:.2f} acc5={ema_metrics['acc5']:.2f}"
             )
+            print_eval_profile("EMA Eval", ema_metrics)
         return
 
     print("Start training backbone...")
@@ -1112,6 +1318,9 @@ def main():
                 f"ema_val_acc1={ema_val_stats['acc1']:.2f} | "
                 f"ema_val_acc5={ema_val_stats['acc5']:.2f}"
             )
+            print_eval_profile(f"EMA Epoch {epoch:03d}", ema_val_stats)
+        print_eval_profile(f"Val Epoch {epoch:03d}", val_stats)
+        print_eval_profile(f"Train-Clean Epoch {epoch:03d}", train_clean_stats)
         if "exit_ratio" in val_stats:
             print(f"Exit ratio: {val_stats['exit_ratio']}")
         print('saving checkpoint...')
