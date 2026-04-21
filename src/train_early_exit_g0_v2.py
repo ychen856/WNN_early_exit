@@ -481,7 +481,7 @@ if __name__ == "__main__":
 
     print("\nSaved:", args.path_out)
     print("Exit cfg list length:", len(payload_exit_cfg))
-
+    print('exit 0:')
     thrs = [0.0, 0.5, 1.0, 2.0, 4.0]
     for thr in thrs:
         out = eval_overall_at_thr_multi_exit(
@@ -495,9 +495,24 @@ if __name__ == "__main__":
         print(thr, out["exit_rate"], out["overall_acc"], out["exited_acc"], out["non_exited_acc"],
               out["margin_mean"], out["margin_p95"])
         print_eval_profile(f"G0-v2 exit0@thr={thr}", out)
+
+    print('exit 1:')
+    thrs = [0.0, 0.5, 1.0, 2.0, 4.0]
+    for thr in thrs:
+        out = eval_overall_at_thr_multi_exit(
+            model, test_loader, device,
+            thr=thr,
+            exit_id=1,
+            exit_cfg_list=payload_exit_cfg,   # <-- 用 ExitConfig list
+            exit_heads=exit_heads,
+            use_prob_margin=False,
+        )
+        print(thr, out["exit_rate"], out["overall_acc"], out["exited_acc"], out["non_exited_acc"],
+              out["margin_mean"], out["margin_p95"])
+        print_eval_profile(f"G0-v2 exit0@thr={thr}", out)
     
     print('=======================================')
-    '''thrs0 = [0.5, 1.0, 1.5, math.inf]
+    thrs0 = [0.5, 1.0, 1.5, math.inf]
     thrs1 = [1.5, 2.0, 2.5, math.inf]
 
     for thr0 in thrs0:
@@ -520,4 +535,16 @@ if __name__ == "__main__":
 
 
             print(thr0, thr1, out)
-            print_eval_profile(f"G0-v2 cascade@({thr0},{thr1})", out)'''
+            print_eval_profile(f"G0-v2 cascade@({thr0},{thr1})", out)
+
+    print('=======================================')
+    best, dbg = sweep_cascade_by_quantile(
+        model=model,
+        val_loader=val_loader,
+        device=device,
+        exit_heads=exit_heads,
+        exit_cfg_list=payload_exit_cfg
+    )
+    
+
+
