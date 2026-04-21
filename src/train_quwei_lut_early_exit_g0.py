@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import os
+import time
 from dataclasses import fields
 from typing import List, Sequence
 
@@ -47,6 +48,14 @@ def _ensure_dir(path: str):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _progress_every(total_batches: int) -> int:
+    return max(1, total_batches // 10)
+
+
+def _progress_prefix(stage: str, layer_idx: int) -> str:
+    return f"[progress][layer{layer_idx}][{stage}]"
 
 
 def load_quweit_backbone_ckpt(path: str, device, use_ema: bool = True):
@@ -107,15 +116,29 @@ def forward_with_all_hidden(model: QuWeiTViT, x: torch.Tensor):
 def analyze_hidden_for_exit(model, loader, device, layer_idx: int, thr_bin: float = 0.0):
     hs = []
     model.eval()
-    for xb, _ in loader:
+    total_batches = len(loader)
+    started_at = time.time()
+    print(f"{_progress_prefix('analyze_hidden', layer_idx)} start total_batches={total_batches}")
+    progress_every = _progress_every(total_batches)
+    for batch_idx, (xb, _) in enumerate(loader, start=1):
         xb = xb.to(device)
         _, h_list = forward_with_all_hidden(model, xb)
         hs.append(h_list[layer_idx - 1].cpu())
+        if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
+            elapsed = time.time() - started_at
+            print(
+                f"{_progress_prefix('analyze_hidden', layer_idx)} "
+                f"batch={batch_idx}/{total_batches} elapsed={elapsed:.1f}s"
+            )
     h = torch.cat(hs, dim=0)
     mean_per_dim = h.mean(dim=0)
     std_per_dim = h.std(dim=0)
     p1_per_dim = (h > thr_bin).float().mean(dim=0)
     bias = (p1_per_dim - 0.5).abs()
+    print(
+        f"{_progress_prefix('analyze_hidden', layer_idx)} done "
+        f"samples={h.shape[0]} dim={h.shape[1]} elapsed={time.time() - started_at:.1f}s"
+    )
     return mean_per_dim, std_per_dim, p1_per_dim, bias
 
 
@@ -135,11 +158,29 @@ def select_exit_keep_idx(mean_per_dim, std_per_dim, p1_per_dim, bias, k: int, ke
 def compute_mu_sigma(model, loader, device, layer_idx: int, exit_keep_idx: torch.Tensor):
     hs = []
     model.eval()
-    for xb, _ in loader:
+    total_batches = len(loader)
+    started_at = time.time()
+    print(
+        f"{_progress_prefix('compute_mu_sigma', layer_idx)} start "
+        f"total_batches={total_batches} k={exit_keep_idx.numel()}"
+    )
+    progress_every = _progress_every(total_batches)
+    keep_idx_device = exit_keep_idx.to(device)
+    for batch_idx, (xb, _) in enumerate(loader, start=1):
         xb = xb.to(device)
         _, h_list = forward_with_all_hidden(model, xb)
-        hs.append(h_list[layer_idx - 1][:, exit_keep_idx.to(device)].cpu())
+        hs.append(h_list[layer_idx - 1][:, keep_idx_device].cpu())
+        if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
+            elapsed = time.time() - started_at
+            print(
+                f"{_progress_prefix('compute_mu_sigma', layer_idx)} "
+                f"batch={batch_idx}/{total_batches} elapsed={elapsed:.1f}s"
+            )
     h = torch.cat(hs, dim=0)
+    print(
+        f"{_progress_prefix('compute_mu_sigma', layer_idx)} done "
+        f"samples={h.shape[0]} k={h.shape[1]} elapsed={time.time() - started_at:.1f}s"
+    )
     return h.mean(dim=0), h.std(dim=0).clamp_min(1e-6)
 
 
@@ -148,15 +189,37 @@ def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, u
     xs = []
     ys = []
     model.eval()
-    for xb, yb in loader:
+    total_batches = len(loader)
+    started_at = time.time()
+    print(
+        f"{_progress_prefix('cache_features', layer_idx)} start "
+        f"total_batches={total_batches} use_norm={use_norm}"
+    )
+    progress_every = _progress_every(total_batches)
+    keep_idx_device = keep_idx.to(device)
+    mu_device = mu.to(device)
+    sigma_device = sigma.to(device)
+    for batch_idx, (xb, yb) in enumerate(loader, start=1):
         xb = xb.to(device)
         _, h_list = forward_with_all_hidden(model, xb)
-        h = h_list[layer_idx - 1][:, keep_idx.to(device)]
+        h = h_list[layer_idx - 1][:, keep_idx_device]
         if use_norm:
-            h = (h - mu.to(device)) / sigma.to(device)
+            h = (h - mu_device) / sigma_device
         xs.append(h.cpu())
         ys.append(yb.cpu())
-    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+        if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
+            elapsed = time.time() - started_at
+            print(
+                f"{_progress_prefix('cache_features', layer_idx)} "
+                f"batch={batch_idx}/{total_batches} elapsed={elapsed:.1f}s"
+            )
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0)
+    print(
+        f"{_progress_prefix('cache_features', layer_idx)} done "
+        f"x_shape={tuple(x.shape)} y_shape={tuple(y.shape)} elapsed={time.time() - started_at:.1f}s"
+    )
+    return x, y
 
 
 def train_one_exit_cached(
