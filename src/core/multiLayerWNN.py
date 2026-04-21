@@ -88,13 +88,15 @@ class MultiLayerWNN(nn.Module):
             prev_bits = n_lut
 
         self.layers = nn.ModuleList(layers)
-        self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
-        '''self.classifier = nn.Sequential(
-            nn.Linear(prev_bits, 128, bias=True),
+        #self.classifier = nn.Linear(prev_bits, num_classes, bias=False)
+        self.classifier = nn.Sequential(
+            nn.Linear(prev_bits, 256, bias=False),
+            nn.Linear(256, num_classes, bias=False),
+        )
+        '''nn.Linear(prev_bits, 128, bias=True),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
-            nn.Linear(128, num_classes, bias=True),
-        )'''
+            nn.Dropout(p=0.0),
+            nn.Linear(128, num_classes, bias=True),'''
         #self.classifier = LogitHead(prev_bits, num_classes)
 
         # for hidden pruning

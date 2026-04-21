@@ -24,6 +24,29 @@ def _head_logits_from_hidden(head, h, device):
     
     return head.classifier(x) / head.exit_tau
 
+
+def get_linear_layers(module: Optional[nn.Module]) -> List[nn.Linear]:
+    if module is None:
+        return []
+    if isinstance(module, nn.Linear):
+        return [module]
+
+    return [m for m in module.modules() if isinstance(m, nn.Linear)]
+
+
+def get_last_linear_layer(module: Optional[nn.Module]) -> Optional[nn.Linear]:
+    linear_layers = get_linear_layers(module)
+    if not linear_layers:
+        return None
+    return linear_layers[-1]
+
+
+def get_classifier_output_dim(classifier: Optional[nn.Module]) -> int:
+    linear = get_last_linear_layer(classifier)
+    if linear is None:
+        raise AttributeError("Classifier does not contain any nn.Linear layer.")
+    return int(linear.out_features)
+
 '''def save_checkpoint(path, model, extra: dict = None):
     # exit info
     exit_enabled = (model.exit1_classifier is not None)
@@ -252,5 +275,3 @@ def print_sweep_table(all_metrics):
             f"{m['non_exited_total']:>10d}"
         )
     print()
-
-

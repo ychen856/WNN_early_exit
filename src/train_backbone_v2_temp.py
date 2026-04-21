@@ -19,6 +19,7 @@ from src.core.infer import *
 from src.core.multiLayerWNN import MultiLayerWNN, save_best_checkpoint_atomic, save_ckpt
 from src.dataio.encode import minmax_normalize, thermometer_encode, dt_thermometer_encode, compute_dt_thresholds
 from src.tools.fpga_tools.export_fpga_bundle import export_multilayer_2layer_for_fpga, verify_multilayer_export
+from src.tools.utils import get_classifier_output_dim, get_last_linear_layer
 from torchvision import transforms
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -205,10 +206,13 @@ def export_wnn_for_fpga(model, path: str, quant_bits: int = None):
     export_data = {}
     export_data["num_layers"] = num_layers
     export_data["input_bits"] = layers[0].in_bits
-    export_data["num_classes"] = model_cpu.classifier.out_features
+    export_data["num_classes"] = get_classifier_output_dim(model_cpu.classifier)
 
     # classifier
-    W_cls = model_cpu.classifier.weight.detach().numpy().astype(np.float32)
+    classifier_linear = get_last_linear_layer(model_cpu.classifier)
+    if classifier_linear is None:
+        raise ValueError("model.classifier must contain at least one nn.Linear for FPGA export.")
+    W_cls = classifier_linear.weight.detach().numpy().astype(np.float32)
     export_data["classifier_weight"] = W_cls  # shape [C, H_last]
 
     # per layer
@@ -278,12 +282,12 @@ if __name__ == "__main__":
         in_bits=in_bits,
         num_classes=C,
         lut_input_size=2,
-        #hidden_luts=(8000, 8000, 8000),
-        hidden_luts=(8000, 8000),
+        hidden_luts=(8000, 8000, 8000),
+        #hidden_luts=(8000, 8000),
         #tau=0.165,
         tau=1.0,
-        #lut_tau_list=[10.0, 10.0, 10.0],
-        lut_tau_list=[10.0, 5.0],
+        lut_tau_list=[10.0, 10.0, 10.0],
+        #lut_tau_list=[10.0, 5.0],
         mapping=None,
         dropout_p=args.dropout_p,  # ✅ 新增：給 MultiLayerWNN 再往下傳
         dataset_meta=dict(name=ds_meta.name, z=ds_meta.z)

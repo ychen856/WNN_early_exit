@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import List, Dict, Tuple, Optional
 import torch.nn.functional as F
 
-from src.tools.utils import get_exit1_features
+from src.tools.utils import get_exit1_features, get_linear_layers
 
 
 from typing import Dict, List, Tuple
@@ -235,12 +235,18 @@ def _count_parameters(module: Optional[nn.Module]) -> int:
     return sum(p.numel() for p in module.parameters())
 
 
-def _linear_flops_and_macs(linear: Optional[nn.Linear]) -> Tuple[float, float]:
-    if linear is None:
+def _linear_flops_and_macs(module: Optional[nn.Module]) -> Tuple[float, float]:
+    linear_layers = get_linear_layers(module)
+    if not linear_layers:
         return 0.0, 0.0
-    macs = float(linear.in_features * linear.out_features)
-    bias_flops = float(linear.out_features if linear.bias is not None else 0.0)
-    flops = 2.0 * macs + bias_flops
+
+    macs = 0.0
+    flops = 0.0
+    for linear in linear_layers:
+        layer_macs = float(linear.in_features * linear.out_features)
+        layer_bias_flops = float(linear.out_features if linear.bias is not None else 0.0)
+        macs += layer_macs
+        flops += 2.0 * layer_macs + layer_bias_flops
     return flops, macs
 
 
