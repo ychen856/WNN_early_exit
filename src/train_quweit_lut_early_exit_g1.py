@@ -109,7 +109,15 @@ def load_quweit_model_and_exits(path: str, device, use_ema_backbone: bool = True
     raise ValueError("Unsupported checkpoint format.")
 
 
-def build_clean_cifar_loaders(cfg: TrainConfig, *, batch_size_train: int, batch_size_eval: int, val_ratio: float, seed: int):
+def build_clean_cifar_loaders(
+    cfg: TrainConfig,
+    *,
+    batch_size_train: int,
+    batch_size_eval: int,
+    val_ratio: float,
+    seed: int,
+    num_workers: int,
+):
     transform = ResizeWithCIFARStats(cfg.image_size)
     dataset_name = cfg.dataset.lower()
     if dataset_name == "cifar10":
@@ -128,9 +136,32 @@ def build_clean_cifar_loaders(cfg: TrainConfig, *, batch_size_train: int, batch_
     gen = torch.Generator().manual_seed(seed)
     train_subset, val_subset = random_split(train_set, [train_size, val_size], generator=gen)
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size_train, shuffle=True, num_workers=0, drop_last=False)
-    val_loader = DataLoader(val_subset, batch_size=batch_size_eval, shuffle=False, num_workers=0, drop_last=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size_eval, shuffle=False, num_workers=0, drop_last=False)
+    def create_loader(dataset, *, batch_size: int, shuffle: bool):
+        try:
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=False,
+            )
+        except RuntimeError as e:
+            if num_workers > 0 and ("shared memory" in str(e).lower() or "shm" in str(e).lower()):
+                print(f"[WARNING] SHM error with num_workers={num_workers}. Retrying with num_workers=0...")
+                return DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    num_workers=0,
+                    pin_memory=cfg.pin_memory,
+                    drop_last=False,
+                )
+            raise
+
+    train_loader = create_loader(train_subset, batch_size=batch_size_train, shuffle=True)
+    val_loader = create_loader(val_subset, batch_size=batch_size_eval, shuffle=False)
+    test_loader = create_loader(test_set, batch_size=batch_size_eval, shuffle=False)
     return train_loader, val_loader, test_loader, num_classes
 
 
@@ -530,6 +561,7 @@ def main():
 
     parser.add_argument("--batch_size_train", type=int, default=128)
     parser.add_argument("--batch_size_eval", type=int, default=256)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -566,6 +598,7 @@ def main():
         batch_size_eval=args.batch_size_eval,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
     if num_classes != backbone_cfg.num_classes:
         raise ValueError(f"Dataset num_classes mismatch: loaders={num_classes}, cfg={backbone_cfg.num_classes}")
