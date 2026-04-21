@@ -2319,8 +2319,8 @@ if __name__ == "__main__":
         exit_heads=exit_heads,
         payload_exit_cfg=payload_exit_cfg,
 
-        thrs_train=(227.0, 18.0),
-        thrs_eval_list=[(227.0, 18.0), (227.0, 10.0)],
+        thrs_train=thr_list,
+        thrs_eval_list=[thr_list, thr_list],
         best_eval_idx=0,                  # 用 (227,18) 選 best
         #best_metric="val_overall_acc",
         best_metric="val_final_tail_only",
