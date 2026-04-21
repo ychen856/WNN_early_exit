@@ -1483,7 +1483,7 @@ if __name__ == "__main__":
         lr_layer=3e-4, lr_exit=3e-3,
         lambda_exit=1.0,
         use_final_loss=False,
-        thrs=(1.0, 1.5),
+        thrs=thr_list,
         weight_decay=1e-3,
         exit_heads=exit_heads,
         payload_exit_cfg=payload_exit_cfg,
