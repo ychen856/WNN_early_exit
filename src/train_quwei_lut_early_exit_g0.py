@@ -58,6 +58,19 @@ def _progress_prefix(stage: str, layer_idx: int) -> str:
     return f"[progress][layer{layer_idx}][{stage}]"
 
 
+def _make_loader(dataset, *, batch_size: int, shuffle: bool, num_workers: int, pin_memory: bool):
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "drop_last": False,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+    return DataLoader(dataset, **kwargs)
+
+
 def load_quweit_backbone_ckpt(path: str, device, use_ema: bool = True):
     ckpt = torch.load(path, map_location=device)
     if "config" not in ckpt or "model_state" not in ckpt:
@@ -79,7 +92,16 @@ def load_quweit_backbone_ckpt(path: str, device, use_ema: bool = True):
     return model.eval(), cfg, ckpt
 
 
-def build_clean_cifar_loaders(cfg: TrainConfig, *, batch_size_train: int, batch_size_eval: int, val_ratio: float, seed: int):
+def build_clean_cifar_loaders(
+    cfg: TrainConfig,
+    *,
+    batch_size_probe: int,
+    batch_size_eval: int,
+    val_ratio: float,
+    seed: int,
+    num_workers: int,
+    pin_memory: bool,
+):
     transform = ResizeWithCIFARStats(cfg.image_size)
     dataset_name = cfg.dataset.lower()
     if dataset_name == "cifar10":
@@ -98,13 +120,31 @@ def build_clean_cifar_loaders(cfg: TrainConfig, *, batch_size_train: int, batch_
     gen = torch.Generator().manual_seed(seed)
     train_clean_set, val_set = random_split(train_set, [train_size, val_size], generator=gen)
 
-    train_clean_loader = DataLoader(train_clean_set, batch_size=batch_size_train, shuffle=False, num_workers=0, drop_last=False)
-    val_loader = DataLoader(val_set, batch_size=batch_size_eval, shuffle=False, num_workers=0, drop_last=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size_eval, shuffle=False, num_workers=0, drop_last=False)
+    train_clean_loader = _make_loader(
+        train_clean_set,
+        batch_size=batch_size_probe,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = _make_loader(
+        val_set,
+        batch_size=batch_size_eval,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = _make_loader(
+        test_set,
+        batch_size=batch_size_eval,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
     return train_clean_loader, val_loader, test_loader, num_classes
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def forward_with_all_hidden(model: QuWeiTViT, x: torch.Tensor):
     out = model(x, return_intermediate=True)
     final_logits = out["logits"]
@@ -112,32 +152,66 @@ def forward_with_all_hidden(model: QuWeiTViT, x: torch.Tensor):
     return final_logits, h_list
 
 
-@torch.no_grad()
+@torch.inference_mode()
+def forward_to_exit_layer(model: QuWeiTViT, x: torch.Tensor, layer_idx: int):
+    if layer_idx < 1 or layer_idx > len(model.blocks):
+        raise ValueError(f"layer_idx must be in [1, {len(model.blocks)}], got {layer_idx}")
+    x = model.patch_embed(x)
+    batch_size = x.shape[0]
+    cls_token = model.cls_token.expand(batch_size, -1, -1)
+    x = torch.cat((cls_token, x), dim=1)
+    x = x + model.pos_embed
+    x = model.pos_drop(x)
+
+    for idx, block in enumerate(model.blocks, start=1):
+        x = block(x)
+        if idx == layer_idx:
+            return x[:, 0, :].detach()
+    raise RuntimeError(f"Failed to stop at layer_idx={layer_idx}")
+
+
+@torch.inference_mode()
 def analyze_hidden_for_exit(model, loader, device, layer_idx: int, thr_bin: float = 0.0):
-    hs = []
     model.eval()
     total_batches = len(loader)
     started_at = time.time()
     print(f"{_progress_prefix('analyze_hidden', layer_idx)} start total_batches={total_batches}")
     progress_every = _progress_every(total_batches)
+    sum_h = None
+    sum_sq = None
+    pos_count = None
+    num_samples = 0
     for batch_idx, (xb, _) in enumerate(loader, start=1):
-        xb = xb.to(device)
-        _, h_list = forward_with_all_hidden(model, xb)
-        hs.append(h_list[layer_idx - 1].cpu())
+        xb = xb.to(device, non_blocking=True)
+        h = forward_to_exit_layer(model, xb, layer_idx).float()
+        if sum_h is None:
+            hidden_dim = h.shape[1]
+            sum_h = torch.zeros(hidden_dim, device=device, dtype=torch.float32)
+            sum_sq = torch.zeros(hidden_dim, device=device, dtype=torch.float32)
+            pos_count = torch.zeros(hidden_dim, device=device, dtype=torch.float32)
+        sum_h += h.sum(dim=0)
+        sum_sq += h.square().sum(dim=0)
+        pos_count += (h > thr_bin).float().sum(dim=0)
+        num_samples += h.shape[0]
         if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
             elapsed = time.time() - started_at
             print(
                 f"{_progress_prefix('analyze_hidden', layer_idx)} "
                 f"batch={batch_idx}/{total_batches} elapsed={elapsed:.1f}s"
             )
-    h = torch.cat(hs, dim=0)
-    mean_per_dim = h.mean(dim=0)
-    std_per_dim = h.std(dim=0)
-    p1_per_dim = (h > thr_bin).float().mean(dim=0)
+    if num_samples == 0:
+        raise ValueError("Empty loader in analyze_hidden_for_exit")
+    mean_per_dim = (sum_h / num_samples).cpu()
+    if num_samples > 1:
+        var = (sum_sq - (sum_h.square() / num_samples)) / (num_samples - 1)
+    else:
+        var = torch.zeros_like(sum_h)
+    std_per_dim = var.clamp_min(0.0).sqrt().cpu()
+    p1_per_dim = (pos_count / num_samples).cpu()
     bias = (p1_per_dim - 0.5).abs()
     print(
         f"{_progress_prefix('analyze_hidden', layer_idx)} done "
-        f"samples={h.shape[0]} dim={h.shape[1]} elapsed={time.time() - started_at:.1f}s"
+        f"samples={num_samples} dim={mean_per_dim.numel()} elapsed={time.time() - started_at:.1f}s"
     )
     return mean_per_dim, std_per_dim, p1_per_dim, bias
 
@@ -154,9 +228,8 @@ def select_exit_keep_idx(mean_per_dim, std_per_dim, p1_per_dim, bias, k: int, ke
     return torch.topk(score, k=k).indices
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_mu_sigma(model, loader, device, layer_idx: int, exit_keep_idx: torch.Tensor):
-    hs = []
     model.eval()
     total_batches = len(loader)
     started_at = time.time()
@@ -166,25 +239,40 @@ def compute_mu_sigma(model, loader, device, layer_idx: int, exit_keep_idx: torch
     )
     progress_every = _progress_every(total_batches)
     keep_idx_device = exit_keep_idx.to(device)
+    sum_h = None
+    sum_sq = None
+    num_samples = 0
     for batch_idx, (xb, _) in enumerate(loader, start=1):
-        xb = xb.to(device)
-        _, h_list = forward_with_all_hidden(model, xb)
-        hs.append(h_list[layer_idx - 1][:, keep_idx_device].cpu())
+        xb = xb.to(device, non_blocking=True)
+        h = forward_to_exit_layer(model, xb, layer_idx)[:, keep_idx_device].float()
+        if sum_h is None:
+            sum_h = torch.zeros(h.shape[1], device=device, dtype=torch.float32)
+            sum_sq = torch.zeros(h.shape[1], device=device, dtype=torch.float32)
+        sum_h += h.sum(dim=0)
+        sum_sq += h.square().sum(dim=0)
+        num_samples += h.shape[0]
         if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
             elapsed = time.time() - started_at
             print(
                 f"{_progress_prefix('compute_mu_sigma', layer_idx)} "
                 f"batch={batch_idx}/{total_batches} elapsed={elapsed:.1f}s"
             )
-    h = torch.cat(hs, dim=0)
+    if num_samples == 0:
+        raise ValueError("Empty loader in compute_mu_sigma")
+    mu = sum_h / num_samples
+    if num_samples > 1:
+        var = (sum_sq - (sum_h.square() / num_samples)) / (num_samples - 1)
+    else:
+        var = torch.zeros_like(sum_h)
+    sigma = var.clamp_min(1e-12).sqrt().clamp_min(1e-6)
     print(
         f"{_progress_prefix('compute_mu_sigma', layer_idx)} done "
-        f"samples={h.shape[0]} k={h.shape[1]} elapsed={time.time() - started_at:.1f}s"
+        f"samples={num_samples} k={mu.numel()} elapsed={time.time() - started_at:.1f}s"
     )
-    return h.mean(dim=0), h.std(dim=0).clamp_min(1e-6)
+    return mu.cpu(), sigma.cpu()
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, use_norm: bool):
     xs = []
     ys = []
@@ -200,9 +288,8 @@ def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, u
     mu_device = mu.to(device)
     sigma_device = sigma.to(device)
     for batch_idx, (xb, yb) in enumerate(loader, start=1):
-        xb = xb.to(device)
-        _, h_list = forward_with_all_hidden(model, xb)
-        h = h_list[layer_idx - 1][:, keep_idx_device]
+        xb = xb.to(device, non_blocking=True)
+        h = forward_to_exit_layer(model, xb, layer_idx)[:, keep_idx_device]
         if use_norm:
             h = (h - mu_device) / sigma_device
         xs.append(h.cpu())
@@ -625,12 +712,15 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--batch_size_train", type=int, default=128)
+    parser.add_argument("--batch_size_probe", type=int, default=512)
+    parser.add_argument("--batch_size_train", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--batch_size_eval", type=int, default=256)
     parser.add_argument("--batch_size_cached", type=int, default=512)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--single_thr_list", type=str, default="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,5.0,6.0")
     parser.add_argument("--cascade_thr_grid", type=str, default="")
@@ -638,15 +728,23 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
+    probe_batch_size = args.batch_size_train if args.batch_size_train is not None else args.batch_size_probe
 
     model, backbone_cfg, raw_ckpt = load_quweit_backbone_ckpt(args.backbone_ckpt, device, use_ema=args.use_ema_backbone)
     print("[info] building clean CIFAR loaders matched to train_quweit_lut_backbone_v2.py preprocessing")
     train_clean_loader, val_loader, test_loader, num_classes = build_clean_cifar_loaders(
         backbone_cfg,
-        batch_size_train=args.batch_size_train,
+        batch_size_probe=probe_batch_size,
         batch_size_eval=args.batch_size_eval,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+    )
+    print(
+        "[info] loader settings "
+        f"probe_batch={probe_batch_size} eval_batch={args.batch_size_eval} "
+        f"num_workers={args.num_workers} pin_memory={args.pin_memory}"
     )
 
     exit_layers = _parse_csv(args.exit_layers, int)
