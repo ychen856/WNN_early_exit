@@ -282,12 +282,12 @@ if __name__ == "__main__":
         in_bits=in_bits,
         num_classes=C,
         lut_input_size=2,
-        hidden_luts=(8000, 8000, 8000),
-        #hidden_luts=(8000, 8000),
+        #hidden_luts=(8000, 8000, 8000),
+        hidden_luts=(8000, 8000),
         #tau=0.165,
         tau=1.0,
-        lut_tau_list=[10.0, 10.0, 10.0],
-        #lut_tau_list=[10.0, 5.0],
+        #lut_tau_list=[10.0, 10.0, 10.0],
+        lut_tau_list=[10.0, 5.0],
         mapping=None,
         dropout_p=args.dropout_p,  # ✅ 新增：給 MultiLayerWNN 再往下傳
         dataset_meta=dict(name=ds_meta.name, z=ds_meta.z)
