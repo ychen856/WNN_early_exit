@@ -738,6 +738,7 @@ def sweep_cascade_by_quantile(
     exit_heads: List[torch.nn.Module],
     exit_cfg_list: List[dict],
     quantile_groups: List[List[float]],
+    test_top_k: int,
 ):
     margin_groups = collect_exit_margins(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list)
     thr_groups = [
@@ -745,17 +746,21 @@ def sweep_cascade_by_quantile(
         for margins, quantiles in zip(margin_groups, quantile_groups)
     ]
     print("[quantile-sweep] threshold groups:", thr_groups)
+    num_combinations = int(torch.tensor([len(g) for g in thr_groups], dtype=torch.long).prod().item()) if thr_groups else 0
+    print(f"[quantile-sweep] evaluating {num_combinations} combinations on VAL; TEST will use top {test_top_k}")
 
     rows_val = []
-    rows_test = []
     for thrs in itertools.product(*thr_groups):
         thrs = list(thrs)
         rows_val.append({"thrs": thrs, **eval_cascade(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
-        rows_test.append({"thrs": thrs, **eval_cascade(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
 
     rows_val.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
+    rows_test = []
+    for row in rows_val[:max(0, test_top_k)]:
+        thrs = list(row["thrs"])
+        rows_test.append({"thrs": thrs, **eval_cascade(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
     rows_test.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
-    return rows_val, rows_test, thr_groups
+    return rows_val, rows_test, thr_groups, num_combinations
 
 
 def print_cascade_quantile_sweep(title: str, rows: List[dict], top_k: int = 20):
@@ -970,7 +975,7 @@ def main():
         print_cascade_sweep("TEST cascade sweep", rows_test)
 
     if cascade_quantile_groups:
-        rows_val, rows_test, thr_groups = sweep_cascade_by_quantile(
+        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(
             model,
             val_loader,
             test_loader,
@@ -978,8 +983,9 @@ def main():
             exit_heads=exit_heads,
             exit_cfg_list=payload_exit_cfg,
             quantile_groups=cascade_quantile_groups,
+            test_top_k=args.sweep_top_k,
         )
-        print(f"[quantile-sweep] num_combinations={int(torch.tensor([len(g) for g in thr_groups]).prod().item())}")
+        print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
 
