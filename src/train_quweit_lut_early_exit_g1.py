@@ -133,26 +133,78 @@ def eval_cascade_quweit(
 
 
 @torch.no_grad()
-def collect_exit_margins(model, loader, device, *, exit_heads: List[torch.nn.Module], exit_cfg_list: List[dict]):
+def collect_cascade_cache_quweit(
+    model,
+    loader,
+    device,
+    *,
+    exit_heads: List[torch.nn.Module],
+    exit_cfg_list: List[dict],
+    use_prob_margin: bool,
+):
     num_exits = len(exit_heads)
-    margins_per_exit = [[] for _ in range(num_exits)]
     model.eval()
     exit_heads = [head.to(device).eval() for head in exit_heads]
+    labels_parts = []
+    final_pred_parts = []
+    exit_pred_parts = [[] for _ in range(num_exits)]
+    margins_per_exit = [[] for _ in range(num_exits)]
 
-    for xb, _ in loader:
+    for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
-        _, h_list = forward_with_all_hidden(model, xb)
+        final_logits, h_list = forward_with_all_hidden(model, xb)
+        labels_parts.append(yb.cpu())
+        final_pred_parts.append(final_logits.argmax(dim=-1).cpu())
         for exit_id in range(num_exits):
             layer_idx = int(exit_cfg_list[exit_id]["layer_idx"])
             logits = exit_heads[exit_id](h_list[layer_idx - 1])
-            top2 = torch.topk(logits, k=2, dim=-1).values
+            exit_pred_parts[exit_id].append(logits.argmax(dim=-1).cpu())
+            if use_prob_margin:
+                top2 = torch.topk(torch.softmax(logits, dim=-1), k=2, dim=-1).values
+            else:
+                top2 = torch.topk(logits, k=2, dim=-1).values
             margins = top2[:, 0] - top2[:, 1]
             margins_per_exit[exit_id].append(margins.detach().cpu())
 
-    out = []
-    for parts in margins_per_exit:
-        out.append(torch.cat(parts, dim=0) if parts else torch.empty(0))
-    return out
+    return {
+        "labels": torch.cat(labels_parts, dim=0) if labels_parts else torch.empty(0, dtype=torch.long),
+        "final_pred": torch.cat(final_pred_parts, dim=0) if final_pred_parts else torch.empty(0, dtype=torch.long),
+        "exit_pred": [torch.cat(parts, dim=0) if parts else torch.empty(0, dtype=torch.long) for parts in exit_pred_parts],
+        "margins": [torch.cat(parts, dim=0) if parts else torch.empty(0) for parts in margins_per_exit],
+    }
+
+
+def eval_cascade_cached_quweit(cache: dict, thrs: List[float]):
+    labels = cache["labels"]
+    final_pred = cache["final_pred"].clone()
+    exit_preds = cache["exit_pred"]
+    margins = cache["margins"]
+    num_exits = len(exit_preds)
+
+    total = int(labels.numel())
+    preds = final_pred
+    undecided = torch.ones(total, dtype=torch.bool)
+    n_exit = [0] * num_exits
+    c_exit = [0] * num_exits
+
+    for exit_id in range(num_exits):
+        take = undecided & (margins[exit_id] > float(thrs[exit_id]))
+        if take.any():
+            preds[take] = exit_preds[exit_id][take]
+            n_exit[exit_id] = int(take.sum().item())
+            c_exit[exit_id] = int((exit_preds[exit_id][take] == labels[take]).sum().item())
+            undecided = undecided & (~take)
+
+    n_final = int(undecided.sum().item())
+    c_final = int((preds[undecided] == labels[undecided]).sum().item()) if n_final > 0 else 0
+    correct = int((preds == labels).sum().item())
+    return {
+        "overall_acc": correct / max(total, 1),
+        "exit_rates": [n / max(total, 1) for n in n_exit],
+        "exit_accs": [(c / n) if n > 0 else float("nan") for c, n in zip(c_exit, n_exit)],
+        "final_rate": n_final / max(total, 1),
+        "final_acc": (c_final / n_final) if n_final > 0 else float("nan"),
+    }
 
 
 def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> List[float]:
@@ -165,19 +217,8 @@ def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> Lis
     return uniq if uniq else [0.0]
 
 
-def sweep_cascade_by_quantile(
-    model,
-    val_loader,
-    test_loader,
-    device,
-    *,
-    exit_heads: List[torch.nn.Module],
-    exit_cfg_list: List[dict],
-    quantile_groups: List[List[float]],
-    use_prob_margin: bool,
-    test_top_k: int,
-):
-    margin_groups = collect_exit_margins(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list)
+def sweep_cascade_by_quantile(val_cache: dict, test_cache: dict, quantile_groups: List[List[float]], test_top_k: int):
+    margin_groups = val_cache["margins"]
     thr_groups = [
         _unique_quantile_values(margins, quantiles)
         for margins, quantiles in zip(margin_groups, quantile_groups)
@@ -189,13 +230,13 @@ def sweep_cascade_by_quantile(
     rows_val = []
     for thrs in itertools.product(*thr_groups):
         thrs = list(thrs)
-        rows_val.append({"thrs": thrs, **eval_cascade_quweit(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs, use_prob_margin=use_prob_margin)})
+        rows_val.append({"thrs": thrs, **eval_cascade_cached_quweit(val_cache, thrs)})
 
     rows_val.sort(key=lambda row: (-row["overall_acc"], row["final_rate"]))
     rows_test = []
     for row in rows_val[:max(0, test_top_k)]:
         thrs = list(row["thrs"])
-        rows_test.append({"thrs": thrs, **eval_cascade_quweit(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs, use_prob_margin=use_prob_margin)})
+        rows_test.append({"thrs": thrs, **eval_cascade_cached_quweit(test_cache, thrs)})
     rows_test.sort(key=lambda row: (-row["overall_acc"], row["final_rate"]))
     return rows_val, rows_test, thr_groups, num_combinations
 
@@ -502,26 +543,26 @@ def main():
 
     backbone = backbone.to(device)
     exit_heads = [head.to(device) for head in exit_heads]
-    print(f"\n[saved] {args.path_out}")
-
-    val_out = eval_cascade_quweit(
+    val_cache = collect_cascade_cache_quweit(
         backbone,
         val_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=eval_thrs,
         use_prob_margin=args.use_prob_margin,
     )
-    test_out = eval_cascade_quweit(
+    test_cache = collect_cascade_cache_quweit(
         backbone,
         test_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=eval_thrs,
         use_prob_margin=args.use_prob_margin,
     )
+    print(f"\n[saved] {args.path_out}")
+
+    val_out = eval_cascade_cached_quweit(val_cache, eval_thrs)
+    test_out = eval_cascade_cached_quweit(test_cache, eval_thrs)
     print(
         f"[VAL] overall={val_out['overall_acc'] * 100:.2f}% "
         f"exit_rates={[round(x, 4) for x in val_out['exit_rates']]} final_rate={val_out['final_rate']:.4f}"
@@ -536,15 +577,7 @@ def main():
         print(f"\n[VAL single-exit scan] exit={exit_id} layer={layer_idx}")
         for thr in single_thr_list:
             thrs = [thr if i == exit_id else eval_thrs[i] for i in range(len(eval_thrs))]
-            out = eval_cascade_quweit(
-                backbone,
-                val_loader,
-                device,
-                exit_heads=exit_heads,
-                exit_cfg_list=payload_exit_cfg,
-                thrs=thrs,
-                use_prob_margin=args.use_prob_margin,
-            )
+            out = eval_cascade_cached_quweit(val_cache, thrs)
             exit_acc = out["exit_accs"][exit_id]
             exit_acc_text = f"{exit_acc * 100:.2f}%" if exit_acc == exit_acc else "nan"
             print(f"  thr={thr:.2f} overall={out['overall_acc'] * 100:.2f}% exit_rate={out['exit_rates'][exit_id] * 100:.2f}% exit_acc={exit_acc_text}")
@@ -554,25 +587,15 @@ def main():
         rows_test = []
         for thrs in itertools.product(*cascade_thr_grid):
             thrs = list(thrs)
-            rows_val.append({"thrs": thrs, **eval_cascade_quweit(backbone, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs, use_prob_margin=args.use_prob_margin)})
-            rows_test.append({"thrs": thrs, **eval_cascade_quweit(backbone, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs, use_prob_margin=args.use_prob_margin)})
+            rows_val.append({"thrs": thrs, **eval_cascade_cached_quweit(val_cache, thrs)})
+            rows_test.append({"thrs": thrs, **eval_cascade_cached_quweit(test_cache, thrs)})
         rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_quantile_sweep("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade grid sweep", rows_test, top_k=args.sweep_top_k)
 
     if cascade_quantile_groups:
-        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(
-            backbone,
-            val_loader,
-            test_loader,
-            device,
-            exit_heads=exit_heads,
-            exit_cfg_list=payload_exit_cfg,
-            quantile_groups=cascade_quantile_groups,
-            use_prob_margin=args.use_prob_margin,
-            test_top_k=args.sweep_top_k,
-        )
+        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(val_cache, test_cache, cascade_quantile_groups, args.sweep_top_k)
         print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)

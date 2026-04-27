@@ -15,6 +15,8 @@ from src.train_quweit_lut_early_exit_g2 import (
     _ensure_dir,
     _parse_csv,
     _parse_threshold_groups,
+    collect_cascade_cache_quweit,
+    eval_cascade_cached_quweit,
     eval_cascade_quweit,
     load_quweit_model_with_exits,
     print_cascade_quantile_sweep,
@@ -248,26 +250,26 @@ def main():
 
     model = model.to(device)
     exit_heads = [head.to(device) for head in exit_heads]
-    print(f"\n[saved] {args.path_out}")
-
-    val_out = eval_cascade_quweit(
+    val_cache = collect_cascade_cache_quweit(
         model,
         val_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=thrs,
         use_prob_margin=args.use_prob_margin,
     )
-    test_out = eval_cascade_quweit(
+    test_cache = collect_cascade_cache_quweit(
         model,
         test_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=thrs,
         use_prob_margin=args.use_prob_margin,
     )
+    print(f"\n[saved] {args.path_out}")
+
+    val_out = eval_cascade_cached_quweit(val_cache, thrs)
+    test_out = eval_cascade_cached_quweit(test_cache, thrs)
     print(
         f"[VAL] overall={val_out['overall_acc'] * 100:.2f}% "
         f"exit_rates={[round(x, 4) for x in val_out['exit_rates']]} final_rate={val_out['final_rate']:.4f}"
@@ -282,15 +284,7 @@ def main():
         print(f"\n[VAL single-exit scan] exit={exit_id} layer={layer_idx}")
         for thr in single_thr_list:
             scan_thrs = [thr if i == exit_id else thrs[i] for i in range(len(thrs))]
-            out = eval_cascade_quweit(
-                model,
-                val_loader,
-                device,
-                exit_heads=exit_heads,
-                exit_cfg_list=payload_exit_cfg,
-                thrs=scan_thrs,
-                use_prob_margin=args.use_prob_margin,
-            )
+            out = eval_cascade_cached_quweit(val_cache, scan_thrs)
             exit_acc = out["exit_accs"][exit_id]
             exit_acc_text = f"{exit_acc * 100:.2f}%" if exit_acc == exit_acc else "nan"
             print(f"  thr={thr:.2f} overall={out['overall_acc'] * 100:.2f}% exit_rate={out['exit_rates'][exit_id] * 100:.2f}% exit_acc={exit_acc_text}")
@@ -300,25 +294,15 @@ def main():
         rows_test = []
         for grid_thrs in itertools.product(*cascade_thr_grid):
             grid_thrs = list(grid_thrs)
-            rows_val.append({"thrs": grid_thrs, **eval_cascade_quweit(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=grid_thrs, use_prob_margin=args.use_prob_margin)})
-            rows_test.append({"thrs": grid_thrs, **eval_cascade_quweit(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=grid_thrs, use_prob_margin=args.use_prob_margin)})
+            rows_val.append({"thrs": grid_thrs, **eval_cascade_cached_quweit(val_cache, grid_thrs)})
+            rows_test.append({"thrs": grid_thrs, **eval_cascade_cached_quweit(test_cache, grid_thrs)})
         rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_quantile_sweep("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade grid sweep", rows_test, top_k=args.sweep_top_k)
 
     if cascade_quantile_groups:
-        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(
-            model,
-            val_loader,
-            test_loader,
-            device,
-            exit_heads=exit_heads,
-            exit_cfg_list=payload_exit_cfg,
-            quantile_groups=cascade_quantile_groups,
-            use_prob_margin=args.use_prob_margin,
-            test_top_k=args.sweep_top_k,
-        )
+        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(val_cache, test_cache, cascade_quantile_groups, args.sweep_top_k)
         print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
