@@ -696,6 +696,98 @@ def print_cascade_sweep(title: str, rows: List[dict]):
         )
 
 
+@torch.no_grad()
+def collect_exit_margins(model, loader, device, *, exit_heads: List[torch.nn.Module], exit_cfg_list: List[dict]):
+    num_exits = len(exit_heads)
+    margins_per_exit = [[] for _ in range(num_exits)]
+    model.eval()
+    exit_heads = [head.to(device).eval() for head in exit_heads]
+
+    for xb, _ in loader:
+        xb = xb.to(device)
+        _, h_list = forward_with_all_hidden(model, xb)
+        for exit_id in range(num_exits):
+            layer_idx = int(exit_cfg_list[exit_id]["layer_idx"])
+            logits = exit_heads[exit_id](h_list[layer_idx - 1])
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            margins = top2[:, 0] - top2[:, 1]
+            margins_per_exit[exit_id].append(margins.detach().cpu())
+
+    out = []
+    for parts in margins_per_exit:
+        out.append(torch.cat(parts, dim=0) if parts else torch.empty(0))
+    return out
+
+
+def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> List[float]:
+    if values.numel() == 0:
+        return [0.0]
+    out = []
+    for q in quantiles:
+        out.append(float(torch.quantile(values, q).item()))
+    uniq = sorted(set(out))
+    return uniq if uniq else [0.0]
+
+
+def sweep_cascade_by_quantile(
+    model,
+    val_loader,
+    test_loader,
+    device,
+    *,
+    exit_heads: List[torch.nn.Module],
+    exit_cfg_list: List[dict],
+    quantile_groups: List[List[float]],
+):
+    margin_groups = collect_exit_margins(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list)
+    thr_groups = [
+        _unique_quantile_values(margins, quantiles)
+        for margins, quantiles in zip(margin_groups, quantile_groups)
+    ]
+    print("[quantile-sweep] threshold groups:", thr_groups)
+
+    rows_val = []
+    rows_test = []
+    for thrs in itertools.product(*thr_groups):
+        thrs = list(thrs)
+        rows_val.append({"thrs": thrs, **eval_cascade(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
+        rows_test.append({"thrs": thrs, **eval_cascade(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
+
+    rows_val.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
+    rows_test.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
+    return rows_val, rows_test, thr_groups
+
+
+def print_cascade_quantile_sweep(title: str, rows: List[dict], top_k: int = 20):
+    print(f"\n=== {title} ===")
+    if not rows:
+        print("(empty)")
+        return
+
+    num_exits = len(rows[0]["thrs"])
+    header_parts = [f"thr{i}" for i in range(num_exits)]
+    header_parts += ["overall%"]
+    for i in range(num_exits):
+        header_parts += [f"exit{i}_rate%", f"exit{i}_acc%"]
+    header_parts += ["avgFLOPs", "avgMACs", "avgLayers", "overhead"]
+    header = "  ".join(f"{item:>11s}" for item in header_parts)
+    print(header)
+    print("-" * len(header))
+
+    for row in rows[:top_k]:
+        values = [f"{thr:>11.4f}" for thr in row["thrs"]]
+        values.append(f"{row['overall_acc'] * 100:>11.2f}")
+        for rate, acc in zip(row["exit_rates"], row["exit_accs"]):
+            acc_text = f"{acc * 100:>11.2f}" if acc == acc else f"{'nan':>11s}"
+            values.append(f"{rate * 100:>11.2f}")
+            values.append(acc_text)
+        values.append(f"{row['avg_flops_per_sample']:>11.0f}")
+        values.append(f"{row['avg_macs_per_sample']:>11.0f}")
+        values.append(f"{row['avg_layers_executed_per_sample']:>11.3f}")
+        values.append(f"{row['compute_overhead_ratio']:>11.4f}")
+        print("  ".join(values))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train cached external early-exit heads from train_quweit_lut_backbone_v2.py checkpoints.")
     parser.add_argument("--backbone_ckpt", type=str, required=True, help="Checkpoint produced by train_quweit_lut_backbone_v2.py")
@@ -724,6 +816,8 @@ def main():
 
     parser.add_argument("--single_thr_list", type=str, default="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,5.0,6.0")
     parser.add_argument("--cascade_thr_grid", type=str, default="")
+    parser.add_argument("--cascade_quantiles", type=str, default="0.0,0.25,0.5,0.75,0.9,0.95")
+    parser.add_argument("--sweep_top_k", type=int, default=20)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -758,6 +852,7 @@ def main():
     init_thrs = _broadcast(_parse_csv(args.init_thr, float), len(exit_layers), "init_thr")
     single_thr_list = _parse_csv(args.single_thr_list, float)
     cascade_thr_grid = _parse_threshold_groups(args.cascade_thr_grid, len(exit_layers))
+    cascade_quantile_groups = _parse_threshold_groups(args.cascade_quantiles, len(exit_layers))
 
     exit_heads = []
     exit_cfg_list = []
@@ -873,6 +968,20 @@ def main():
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_sweep("VAL cascade sweep", rows_val)
         print_cascade_sweep("TEST cascade sweep", rows_test)
+
+    if cascade_quantile_groups:
+        rows_val, rows_test, thr_groups = sweep_cascade_by_quantile(
+            model,
+            val_loader,
+            test_loader,
+            device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            quantile_groups=cascade_quantile_groups,
+        )
+        print(f"[quantile-sweep] num_combinations={int(torch.tensor([len(g) for g in thr_groups]).prod().item())}")
+        print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
+        print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
 
 
 if __name__ == "__main__":

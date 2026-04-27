@@ -1,17 +1,19 @@
 import argparse
+import copy
 import itertools
 import os
-from typing import List, Sequence
+from dataclasses import fields
+from typing import List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
-from src.core.linearExitHead import build_exits_from_ckpt
+from src.core.linearExitHead import build_exit_heads_from_cfg
 from src.core.multiLayerWNN import save_ckpt_v2
-from src.early_exit import _head_logits_from_hidden_trainable
+from src.early_exit import _head_logits_from_hidden_trainable, _margin_from_logits
 from src.exit.ckpt_exit import ExitConfig
-from src.train_quweit_lut_backbone_v2 import QuWeiTViT
-from src.train_quweit_lut_early_exit_g0 import build_clean_cifar_loaders, load_quweit_backbone_ckpt
+from src.train_quweit_lut_backbone_v2 import QuWeiTViT, TrainConfig
+from src.train_quweit_lut_early_exit_g0 import build_clean_cifar_loaders
 
 
 def _parse_csv(s: str, cast=float) -> List:
@@ -43,9 +45,37 @@ def _parse_threshold_groups(s: str, num_exits: int, name: str) -> List[List[floa
     return _broadcast(groups, num_exits, name) if groups else []
 
 
-def load_quweit_exit_pack(path: str, device, num_classes: int):
-    exit_heads, exit_cfg_list = build_exits_from_ckpt(path, device, num_classes=num_classes)
-    return exit_heads, exit_cfg_list
+def _cfg_from_payload(cfg_payload: dict) -> TrainConfig:
+    allowed = {f.name for f in fields(TrainConfig)}
+    cfg_dict = {k: v for k, v in cfg_payload.items() if k in allowed}
+    cfg = TrainConfig(**cfg_dict)
+    cfg.use_exit = False
+    return cfg
+
+
+def load_quweit_model_with_exits(path: str, device):
+    ckpt = torch.load(path, map_location=device)
+    if "model_state_dict" not in ckpt or "exit_cfg" not in ckpt or "exits_state_dict" not in ckpt:
+        raise ValueError("Expected a save_ckpt_v2 checkpoint containing model_state_dict / exit_cfg / exits_state_dict.")
+
+    backbone_cfg_payload = ckpt.get("backbone_cfg", {})
+    cfg_payload = backbone_cfg_payload["config"] if isinstance(backbone_cfg_payload, dict) and "config" in backbone_cfg_payload else backbone_cfg_payload
+    cfg = _cfg_from_payload(cfg_payload)
+
+    model = QuWeiTViT(cfg).to(device)
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    print("[load_quweit_model_with_exits] backbone missing:", missing)
+    print("[load_quweit_model_with_exits] backbone unexpected:", unexpected)
+
+    exit_cfg_list = [ExitConfig.from_payload(item) for item in ckpt["exit_cfg"]]
+    exit_heads = build_exit_heads_from_cfg(exit_cfg_list, num_classes=cfg.num_classes, device=device)
+    exits_state_dict = ckpt["exits_state_dict"]
+    if len(exits_state_dict) != len(exit_heads):
+        raise ValueError("Checkpoint exit heads/state length mismatch.")
+    for head, sd in zip(exit_heads, exits_state_dict):
+        head.load_state_dict(sd, strict=True)
+
+    return model.eval(), cfg, ckpt, exit_heads, exit_cfg_list
 
 
 def set_requires_grad(module, flag: bool):
@@ -68,7 +98,7 @@ def eval_cascade_quweit(
     *,
     exit_heads: List[torch.nn.Module],
     exit_cfg_list: List[dict],
-    thrs: List[float],
+    thrs: Sequence[float],
     use_prob_margin: bool = False,
 ):
     assert len(exit_heads) == len(exit_cfg_list)
@@ -99,9 +129,7 @@ def eval_cascade_quweit(
                 break
 
             layer_idx_1based = int(cfg["layer_idx"])
-            h = h_list[layer_idx_1based - 1]
-            logits = head(h)
-
+            logits = head(h_list[layer_idx_1based - 1])
             if use_prob_margin:
                 top2 = torch.topk(torch.softmax(logits, dim=-1), k=2, dim=-1).values
             else:
@@ -222,71 +250,83 @@ def print_cascade_quantile_sweep(title: str, rows: List[dict], top_k: int = 20):
         print("  ".join(values))
 
 
-def cotrain_g1_stage_quweit(
+def cotrain_g2_quweit(
     model,
     train_loader,
     val_loader,
     device,
     *,
     num_epochs: int,
-    layer_idx: int,
-    exit_id: int,
-    lr_layer: float,
-    lr_exit: float,
-    lambda_exit: float,
-    use_final_loss: bool,
-    lambda_final: float,
-    thrs: List[float],
-    weight_decay: float,
-    grad_clip: float,
+    train_block_indices: Sequence[int],
+    freeze_block_indices: Sequence[int],
     exit_heads: List[torch.nn.Module],
     payload_exit_cfg: List[dict],
-    use_prob_margin: bool = False,
+    thrs: Sequence[float],
+    use_prob_margin: bool,
+    lambda_final: float,
+    lambda_exits: Sequence[float],
+    lr_backbone: float,
+    lr_classifier: float,
+    lr_exits: float,
+    weight_decay: float,
+    grad_clip: Optional[float],
+    gate_temps: Sequence[float],
+    use_gate_weighting: bool,
 ):
-    assert len(exit_heads) == len(payload_exit_cfg)
-    assert 0 <= layer_idx < len(model.blocks)
-    assert 0 <= exit_id < len(exit_heads)
-
     model = model.to(device)
+    assert len(exit_heads) == len(payload_exit_cfg)
+    assert len(thrs) == len(exit_heads)
+    assert len(lambda_exits) == len(exit_heads)
+    assert len(gate_temps) == len(exit_heads)
 
     set_requires_grad(model, False)
-    set_requires_grad(model.blocks[layer_idx], True)
-    for head in exit_heads:
-        set_requires_grad(head, False)
-    exit_heads[exit_id] = exit_heads[exit_id].to(device)
-    set_requires_grad(exit_heads[exit_id], True)
+    for idx in freeze_block_indices:
+        if idx < 0 or idx >= len(model.blocks):
+            raise ValueError(f"freeze block index out of range: {idx}")
+        set_requires_grad(model.blocks[idx], False)
+    for idx in train_block_indices:
+        if idx < 0 or idx >= len(model.blocks):
+            raise ValueError(f"train block index out of range: {idx}")
+        set_requires_grad(model.blocks[idx], True)
 
-    if hasattr(model, "head"):
-        set_requires_grad(model.head, False)
+    set_requires_grad(model.head, True)
     if hasattr(model, "norm"):
-        set_requires_grad(model.norm, False)
-    if hasattr(model, "patch_embed"):
-        set_requires_grad(model.patch_embed, False)
+        set_requires_grad(model.norm, True)
 
-    params_layer = [p for p in model.blocks[layer_idx].parameters() if p.requires_grad]
-    params_exit = [p for p in exit_heads[exit_id].parameters() if p.requires_grad]
-    if not params_layer:
-        raise ValueError(f"No trainable params in model.blocks[{layer_idx}]")
-    if not params_exit:
-        raise ValueError(f"No trainable params in exit_heads[{exit_id}]")
+    exit_heads = [head.to(device) for head in exit_heads]
+    for head in exit_heads:
+        set_requires_grad(head, True)
+
+    params_backbone = []
+    for idx in train_block_indices:
+        params_backbone.extend([p for p in model.blocks[idx].parameters() if p.requires_grad])
+    params_classifier = [p for p in model.head.parameters() if p.requires_grad]
+    if hasattr(model, "norm"):
+        params_classifier.extend([p for p in model.norm.parameters() if p.requires_grad])
+    params_exits = []
+    for head in exit_heads:
+        params_exits.extend([p for p in head.parameters() if p.requires_grad])
+
+    print(
+        f"[g2] trainable params: backbone={sum(p.numel() for p in params_backbone)} "
+        f"classifier={sum(p.numel() for p in params_classifier)} "
+        f"exits={sum(p.numel() for p in params_exits)}"
+    )
 
     optimizer = torch.optim.AdamW(
         [
-            {"params": params_layer, "lr": lr_layer, "weight_decay": weight_decay},
-            {"params": params_exit, "lr": lr_exit, "weight_decay": weight_decay},
+            {"params": params_backbone, "lr": lr_backbone, "weight_decay": weight_decay},
+            {"params": params_classifier, "lr": lr_classifier, "weight_decay": weight_decay},
+            {"params": params_exits, "lr": lr_exits, "weight_decay": weight_decay},
         ]
     )
 
-    best = {"val_overall_acc": -1.0, "state": None, "exit_states": None}
+    best = {"val_overall_acc": -1.0, "state": None}
 
     for epoch in range(num_epochs):
         model.train()
-        exit_heads[exit_id].train()
-
-        loss_sum = 0.0
-        total = 0
-        correct_exit = 0
-        correct_final = 0
+        for head in exit_heads:
+            head.train()
 
         for xb, yb in train_loader:
             xb = xb.to(device, non_blocking=True)
@@ -294,27 +334,49 @@ def cotrain_g1_stage_quweit(
             optimizer.zero_grad(set_to_none=True)
 
             final_logits, h_list = forward_with_all_hidden(model, xb)
-            exit_logits = _head_logits_from_hidden_trainable(exit_heads[exit_id], h_list[layer_idx], device)
+            ce_final = F.cross_entropy(final_logits, yb, reduction="none")
 
-            loss_exit = F.cross_entropy(exit_logits, yb)
-            loss = lambda_exit * loss_exit
-            if use_final_loss:
-                loss_final = F.cross_entropy(final_logits, yb)
-                loss = loss + lambda_final * loss_final
+            if use_gate_weighting:
+                eps = 1e-8
+                u = torch.ones_like(ce_final)
+                loss_exit_sum = 0.0
+
+                for i, (cfg, head) in enumerate(zip(payload_exit_cfg, exit_heads)):
+                    layer_idx = int(cfg["layer_idx"]) - 1
+                    logits_i = _head_logits_from_hidden_trainable(head, h_list[layer_idx], device)
+                    ce_i = F.cross_entropy(logits_i, yb, reduction="none")
+                    m_i = _margin_from_logits(logits_i, use_prob=use_prob_margin)
+                    w_i = torch.sigmoid((m_i - float(thrs[i])) / float(gate_temps[i]))
+                    take_i = u * w_i
+                    take_i_det = take_i.detach()
+                    loss_i = (take_i_det * ce_i).sum() / (take_i_det.sum() + eps)
+                    loss_exit_sum = loss_exit_sum + float(lambda_exits[i]) * loss_i
+                    u = u * (1.0 - w_i)
+
+                u_det = u.detach()
+                loss_final = (u_det * ce_final).sum() / (u_det.sum() + eps)
+                loss = float(lambda_final) * loss_final + loss_exit_sum
+            else:
+                loss_final = ce_final.mean()
+                loss_exit_sum = 0.0
+                for i, (cfg, head) in enumerate(zip(payload_exit_cfg, exit_heads)):
+                    layer_idx = int(cfg["layer_idx"]) - 1
+                    logits_i = _head_logits_from_hidden_trainable(head, h_list[layer_idx], device)
+                    loss_exit_i = F.cross_entropy(logits_i, yb)
+                    loss_exit_sum = loss_exit_sum + float(lambda_exits[i]) * loss_exit_i
+                loss = float(lambda_final) * loss_final + loss_exit_sum
 
             loss.backward()
-            if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(params_layer, grad_clip)
-                torch.nn.utils.clip_grad_norm_(params_exit, grad_clip)
+            if grad_clip is not None:
+                if params_backbone:
+                    torch.nn.utils.clip_grad_norm_(params_backbone, grad_clip)
+                if params_classifier:
+                    torch.nn.utils.clip_grad_norm_(params_classifier, grad_clip)
+                if params_exits:
+                    torch.nn.utils.clip_grad_norm_(params_exits, grad_clip)
             optimizer.step()
 
-            bsz = yb.size(0)
-            loss_sum += float(loss.item()) * bsz
-            total += bsz
-            correct_exit += int((exit_logits.argmax(dim=-1) == yb).sum().item())
-            correct_final += int((final_logits.argmax(dim=-1) == yb).sum().item())
-
-        out = eval_cascade_quweit(
+        out_val = eval_cascade_quweit(
             model,
             val_loader,
             device,
@@ -323,35 +385,31 @@ def cotrain_g1_stage_quweit(
             thrs=thrs,
             use_prob_margin=use_prob_margin,
         )
-
+        va_overall = out_val["overall_acc"]
         print(
-            f"[G1-stage] layer={layer_idx + 1} exit={exit_id} Ep{epoch:03d} "
-            f"| train_loss={loss_sum / max(total, 1):.4f} "
-            f"| train_exit_acc={correct_exit / max(total, 1) * 100:.2f}% "
-            f"| train_final_acc={correct_final / max(total, 1) * 100:.2f}% "
-            f"| overall@{[round(float(x), 4) for x in thrs]} va={out['overall_acc'] * 100:.2f} "
-            f"| exit_rates={[round(x, 4) for x in out['exit_rates']]} final_rate={out['final_rate']:.4f}"
+            f"[G2] Ep{epoch:03d} | overall@{tuple(float(x) for x in thrs)} va={va_overall * 100:.2f} "
+            f"| exit_rates={out_val['exit_rates']} final_rate={out_val['final_rate']:.4f}"
         )
 
-        if out["overall_acc"] > best["val_overall_acc"]:
-            best["val_overall_acc"] = float(out["overall_acc"])
-            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best["exit_states"] = [{k: v.detach().cpu().clone() for k, v in head.state_dict().items()} for head in exit_heads]
+        if va_overall > best["val_overall_acc"]:
+            best["val_overall_acc"] = float(va_overall)
+            best["state"] = {
+                "model": copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()}),
+                "exits": [copy.deepcopy({k: v.detach().cpu() for k, v in head.state_dict().items()}) for head in exit_heads],
+            }
 
     if best["state"] is not None:
-        model.load_state_dict(best["state"], strict=False)
-        for head, sd in zip(exit_heads, best["exit_states"]):
-            head.load_state_dict(sd, strict=True)
+        model.load_state_dict(best["state"]["model"], strict=True)
+        for i, head in enumerate(exit_heads):
+            head.load_state_dict(best["state"]["exits"][i], strict=True)
 
     return model, exit_heads, best
 
 
 def main():
-    parser = argparse.ArgumentParser(description="QuWeiT g1 co-train: use g0 exit heads + backbone_v2 backbone.")
-    parser.add_argument("--backbone_ckpt", type=str, required=True, help="Checkpoint produced by train_quweit_lut_backbone_v2.py")
-    parser.add_argument("--exit_ckpt", type=str, required=True, help="Checkpoint produced by train_quweit_lut_early_exit_g0.py")
+    parser = argparse.ArgumentParser(description="QuWeiT g2 co-train from a g1 checkpoint.")
+    parser.add_argument("--model_ckpt", type=str, required=True, help="Checkpoint produced by train_quweit_lut_early_exit_g1.py")
     parser.add_argument("--path_out", type=str, required=True)
-    parser.add_argument("--use_ema_backbone", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--batch_size_train", type=int, default=128)
     parser.add_argument("--batch_size_eval", type=int, default=256)
@@ -360,16 +418,20 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--stage_exit_ids", type=str, default="", help='0-based exit ids, e.g. "0,1"; empty means all exits')
-    parser.add_argument("--epochs_per_stage", type=str, default="30")
-    parser.add_argument("--lr_layer", type=str, default="3e-4")
-    parser.add_argument("--lr_exit", type=str, default="3e-3")
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--lambda_exit", type=float, default=0.3)
-    parser.add_argument("--lambda_final", type=float, default=1.0)
-    parser.add_argument("--use_final_loss", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train_blocks", type=str, default="", help='0-based block indices to train; empty means all blocks after the earliest exit block')
+    parser.add_argument("--freeze_blocks", type=str, default="", help='0-based block indices to freeze; empty means blocks up to and including the earliest exit block')
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr_backbone", type=float, default=1e-4)
+    parser.add_argument("--lr_classifier", type=float, default=3e-4)
+    parser.add_argument("--lr_exits", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--thr", type=str, default="", help='comma-separated thresholds per exit; empty means use g0 checkpoint values')
+
+    parser.add_argument("--thr", type=str, default="", help="comma-separated thresholds per exit; empty means use checkpoint values")
+    parser.add_argument("--lambda_final", type=float, default=1.0)
+    parser.add_argument("--lambda_exits", type=str, default="0.05")
+    parser.add_argument("--gate_temps", type=str, default="1.0")
+    parser.add_argument("--use_gate_weighting", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_prob_margin", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--single_thr_list", type=str, default="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,5.0,6.0")
     parser.add_argument("--cascade_thr_grid", type=str, default="")
@@ -380,19 +442,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
 
-    backbone, backbone_cfg, raw_backbone_ckpt = load_quweit_backbone_ckpt(
-        args.backbone_ckpt,
-        device,
-        use_ema=args.use_ema_backbone,
-    )
-
-    exit_heads, exit_cfg_list = load_quweit_exit_pack(
-        args.exit_ckpt,
-        device,
-        num_classes=backbone_cfg.num_classes,
-    )
+    model, backbone_cfg, raw_ckpt, exit_heads, exit_cfg_list = load_quweit_model_with_exits(args.model_ckpt, device)
     if not exit_heads:
-        raise ValueError("No exit heads found in --exit_ckpt")
+        raise ValueError("No exit heads found in --model_ckpt")
 
     train_loader, val_loader, test_loader, num_classes = build_clean_cifar_loaders(
         backbone_cfg,
@@ -407,114 +459,110 @@ def main():
         raise ValueError(f"Dataset num_classes mismatch: loaders={num_classes}, cfg={backbone_cfg.num_classes}")
 
     payload_exit_cfg = [cfg.to_payload() for cfg in exit_cfg_list]
-    for cfg in payload_exit_cfg:
-        layer_idx_1based = int(cfg["layer_idx"])
-        if layer_idx_1based < 1 or layer_idx_1based > backbone_cfg.depth:
-            raise ValueError(f"Invalid exit layer {layer_idx_1based} for depth={backbone_cfg.depth}")
-
     if args.thr.strip():
         override_thrs = _broadcast(_parse_csv(args.thr, float), len(payload_exit_cfg), "thr")
         for cfg, thr in zip(payload_exit_cfg, override_thrs):
             cfg["thr"] = float(thr)
-
-    eval_thrs = [float(cfg["thr"]) for cfg in payload_exit_cfg]
+    thrs = [float(cfg["thr"]) for cfg in payload_exit_cfg]
     single_thr_list = _parse_csv(args.single_thr_list, float)
     cascade_thr_grid = _parse_threshold_groups(args.cascade_thr_grid, len(payload_exit_cfg), "cascade_thr_grid")
     cascade_quantile_groups = _parse_threshold_groups(args.cascade_quantiles, len(payload_exit_cfg), "cascade_quantiles")
 
-    if args.stage_exit_ids.strip():
-        stage_exit_ids = _parse_csv(args.stage_exit_ids, int)
-    else:
-        stage_exit_ids = list(range(len(exit_heads)))
-    if not stage_exit_ids:
-        raise ValueError("No stages to run.")
-    for exit_id in stage_exit_ids:
-        if exit_id < 0 or exit_id >= len(exit_heads):
-            raise ValueError(f"Invalid stage exit id {exit_id}; num_exits={len(exit_heads)}")
+    lambda_exits = _broadcast(_parse_csv(args.lambda_exits, float), len(payload_exit_cfg), "lambda_exits")
+    gate_temps = _broadcast(_parse_csv(args.gate_temps, float), len(payload_exit_cfg), "gate_temps")
 
-    epochs_per_stage = _broadcast(_parse_csv(args.epochs_per_stage, int), len(stage_exit_ids), "epochs_per_stage")
-    lr_layers = _broadcast(_parse_csv(args.lr_layer, float), len(stage_exit_ids), "lr_layer")
-    lr_exits = _broadcast(_parse_csv(args.lr_exit, float), len(stage_exit_ids), "lr_exit")
+    exit_layers_0based = [int(cfg["layer_idx"]) - 1 for cfg in payload_exit_cfg]
+    earliest_exit_block = min(exit_layers_0based)
+    if args.train_blocks.strip():
+        train_blocks = _parse_csv(args.train_blocks, int)
+    else:
+        train_blocks = list(range(min(earliest_exit_block + 1, len(model.blocks)), len(model.blocks)))
+    if args.freeze_blocks.strip():
+        freeze_blocks = _parse_csv(args.freeze_blocks, int)
+    else:
+        freeze_blocks = list(range(earliest_exit_block + 1))
+
+    if not train_blocks:
+        raise ValueError("No train blocks selected.")
+    for idx in train_blocks + freeze_blocks:
+        if idx < 0 or idx >= len(model.blocks):
+            raise ValueError(f"Block index out of range: {idx}")
+    if set(train_blocks) & set(freeze_blocks):
+        raise ValueError(f"train_blocks and freeze_blocks overlap: {sorted(set(train_blocks) & set(freeze_blocks))}")
 
     print("[info] loader settings "
           f"train_batch={args.batch_size_train} eval_batch={args.batch_size_eval} "
           f"num_workers={args.num_workers} pin_memory={args.pin_memory}")
-    print("[info] stage plan")
-    for stage_idx, exit_id in enumerate(stage_exit_ids, start=1):
-        layer_idx_1based = int(payload_exit_cfg[exit_id]["layer_idx"])
-        print(
-            f"  stage {stage_idx}: exit_id={exit_id} "
-            f"layer={layer_idx_1based} epochs={epochs_per_stage[stage_idx - 1]} "
-            f"lr_layer={lr_layers[stage_idx - 1]} lr_exit={lr_exits[stage_idx - 1]} thr={eval_thrs[exit_id]}"
-        )
+    print(
+        f"[info] g2 plan train_blocks={train_blocks} freeze_blocks={freeze_blocks} "
+        f"thrs={thrs} lambda_exits={lambda_exits} gate_temps={gate_temps}"
+    )
 
-    for stage_idx, exit_id in enumerate(stage_exit_ids):
-        layer_idx = int(payload_exit_cfg[exit_id]["layer_idx"]) - 1
-        backbone, exit_heads, best = cotrain_g1_stage_quweit(
-            backbone,
-            train_loader,
-            val_loader,
-            device,
-            num_epochs=epochs_per_stage[stage_idx],
-            layer_idx=layer_idx,
-            exit_id=exit_id,
-            lr_layer=lr_layers[stage_idx],
-            lr_exit=lr_exits[stage_idx],
-            lambda_exit=args.lambda_exit,
-            use_final_loss=args.use_final_loss,
-            lambda_final=args.lambda_final,
-            thrs=eval_thrs,
-            weight_decay=args.weight_decay,
-            grad_clip=args.grad_clip,
-            exit_heads=exit_heads,
-            payload_exit_cfg=payload_exit_cfg,
-            use_prob_margin=args.use_prob_margin,
-        )
-        print(f"[stage {stage_idx + 1}] best val overall acc = {best['val_overall_acc'] * 100:.2f}%")
+    model, exit_heads, best = cotrain_g2_quweit(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        num_epochs=args.epochs,
+        train_block_indices=train_blocks,
+        freeze_block_indices=freeze_blocks,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        thrs=thrs,
+        use_prob_margin=args.use_prob_margin,
+        lambda_final=args.lambda_final,
+        lambda_exits=lambda_exits,
+        lr_backbone=args.lr_backbone,
+        lr_classifier=args.lr_classifier,
+        lr_exits=args.lr_exits,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        gate_temps=gate_temps,
+        use_gate_weighting=args.use_gate_weighting,
+    )
+    print(f"[g2] best val overall acc = {best['val_overall_acc'] * 100:.2f}%")
 
     _ensure_dir(args.path_out)
     save_ckpt_v2(
         args.path_out,
-        backbone.cpu(),
+        model.cpu(),
         [head.cpu() for head in exit_heads],
-        {
-            "source": "train_quweit_lut_early_exit_g1.py",
-            "backbone_ckpt": args.backbone_ckpt,
-            "exit_ckpt": args.exit_ckpt,
-            "config": raw_backbone_ckpt["config"],
-        },
+        raw_ckpt["backbone_cfg"],
         exit_cfg_list=[ExitConfig.from_payload(cfg).to_payload() for cfg in payload_exit_cfg],
         extra={
             "dataset": backbone_cfg.dataset,
-            "train_mode": "g1_stagewise_cotrain",
-            "stage_exit_ids": stage_exit_ids,
-            "use_final_loss": bool(args.use_final_loss),
-            "lambda_exit": float(args.lambda_exit),
+            "train_mode": "g2_cotrain",
+            "source_ckpt": args.model_ckpt,
+            "train_blocks": train_blocks,
+            "freeze_blocks": freeze_blocks,
             "lambda_final": float(args.lambda_final),
-            "eval_thrs": eval_thrs,
+            "lambda_exits": [float(x) for x in lambda_exits],
+            "gate_temps": [float(x) for x in gate_temps],
+            "use_gate_weighting": bool(args.use_gate_weighting),
+            "eval_thrs": thrs,
         },
     )
 
-    backbone = backbone.to(device)
+    model = model.to(device)
     exit_heads = [head.to(device) for head in exit_heads]
     print(f"\n[saved] {args.path_out}")
 
     val_out = eval_cascade_quweit(
-        backbone,
+        model,
         val_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=eval_thrs,
+        thrs=thrs,
         use_prob_margin=args.use_prob_margin,
     )
     test_out = eval_cascade_quweit(
-        backbone,
+        model,
         test_loader,
         device,
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
-        thrs=eval_thrs,
+        thrs=thrs,
         use_prob_margin=args.use_prob_margin,
     )
     print(
@@ -530,14 +578,14 @@ def main():
         layer_idx = int(cfg["layer_idx"])
         print(f"\n[VAL single-exit scan] exit={exit_id} layer={layer_idx}")
         for thr in single_thr_list:
-            thrs = [thr if i == exit_id else eval_thrs[i] for i in range(len(eval_thrs))]
+            scan_thrs = [thr if i == exit_id else thrs[i] for i in range(len(thrs))]
             out = eval_cascade_quweit(
-                backbone,
+                model,
                 val_loader,
                 device,
                 exit_heads=exit_heads,
                 exit_cfg_list=payload_exit_cfg,
-                thrs=thrs,
+                thrs=scan_thrs,
                 use_prob_margin=args.use_prob_margin,
             )
             exit_acc = out["exit_accs"][exit_id]
@@ -547,10 +595,10 @@ def main():
     if cascade_thr_grid:
         rows_val = []
         rows_test = []
-        for thrs in itertools.product(*cascade_thr_grid):
-            thrs = list(thrs)
-            rows_val.append({"thrs": thrs, **eval_cascade_quweit(backbone, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs, use_prob_margin=args.use_prob_margin)})
-            rows_test.append({"thrs": thrs, **eval_cascade_quweit(backbone, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs, use_prob_margin=args.use_prob_margin)})
+        for grid_thrs in itertools.product(*cascade_thr_grid):
+            grid_thrs = list(grid_thrs)
+            rows_val.append({"thrs": grid_thrs, **eval_cascade_quweit(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=grid_thrs, use_prob_margin=args.use_prob_margin)})
+            rows_test.append({"thrs": grid_thrs, **eval_cascade_quweit(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=grid_thrs, use_prob_margin=args.use_prob_margin)})
         rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_quantile_sweep("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
@@ -558,7 +606,7 @@ def main():
 
     if cascade_quantile_groups:
         rows_val, rows_test, thr_groups = sweep_cascade_by_quantile(
-            backbone,
+            model,
             val_loader,
             test_loader,
             device,
