@@ -623,4 +623,8 @@ if __name__ == "__main__":
     m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
     print(f"[G2 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
 
-    
+    best, dbg = sweep_cascade_by_quantile(
+        model=model,
+        val_loader=val_loader,
+        device=device,
+    )

@@ -412,7 +412,7 @@ if __name__ == "__main__":
     s = stats["std_per_dim"]          # [2000]
 
     score = (p * (1 - p)) * s         # [2000]
-    K = 1024
+    K = 500
     exit1_keep_idx = torch.topk(score, k=K).indices.to(device)
 
 
@@ -485,3 +485,12 @@ if __name__ == "__main__":
     print(f"[G0 Final head only] test_acc={final_acc*100:.2f}%")
     m = eval_overall_at_thr(model, test_loader, device, thr=2.0)
     print(f"[G0 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
+
+
+
+    best, dbg = sweep_cascade_by_quantile(
+        model=model,
+        val_loader=val_loader,
+        device=device,
+    )
+	

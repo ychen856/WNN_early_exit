@@ -50,6 +50,55 @@ import torch
 def _has_buf(t: Optional[torch.Tensor]) -> bool:
     return (t is not None) and isinstance(t, torch.Tensor) and (t.numel() > 0)
 
+def get_linear_layers(module: Optional[nn.Module]) -> List[nn.Linear]:
+    """
+    Recursively collect all nn.Linear layers under a module.
+    Returns an empty list if module is None.
+    """
+    if module is None:
+        return []
+    return [m for m in module.modules() if isinstance(m, nn.Linear)]
+
+@torch.no_grad()
+def _head_logits_from_hidden(head: nn.Module, h: torch.Tensor, device=None) -> torch.Tensor:
+    """
+    Build exit-head logits from a hidden tensor.
+    Supports both:
+    - external ExitHead objects with keep_idx / mu / sigma / classifier / exit_tau
+    - trainable heads stored in-model with exit_keep_idx / classifier / exit_tau
+    """
+    if device is not None:
+        h = h.to(device)
+
+    keep_idx = None
+    if hasattr(head, "keep_idx"):
+        keep_idx = head.keep_idx
+    elif hasattr(head, "exit_keep_idx"):
+        keep_idx = head.exit_keep_idx
+
+    x = h
+    if keep_idx is not None and isinstance(keep_idx, torch.Tensor) and keep_idx.numel() > 0:
+        if device is not None:
+            keep_idx = keep_idx.to(device)
+        x = x[:, keep_idx]
+
+    use_norm = bool(getattr(head, "use_norm", False))
+    mu = getattr(head, "mu", None)
+    sigma = getattr(head, "sigma", None)
+    if use_norm and isinstance(mu, torch.Tensor) and isinstance(sigma, torch.Tensor):
+        if mu.numel() > 0 and sigma.numel() > 0:
+            if device is not None:
+                mu = mu.to(device)
+                sigma = sigma.to(device)
+            x = (x - mu) / (sigma + 1e-12)
+
+    classifier = getattr(head, "classifier", None)
+    if classifier is None:
+        raise ValueError("head must have a classifier attribute.")
+
+    exit_tau = float(getattr(head, "exit_tau", 1.0))
+    return classifier(x) / exit_tau
+
 def get_exit1_features(model: nn.Module, h1: torch.Tensor) -> torch.Tensor:
     """
     h1: [B, D1] (output of first LUT layer)
@@ -187,5 +236,3 @@ def print_sweep_table(all_metrics):
             f"{m['non_exited_total']:>10d}"
         )
     print()
-
-

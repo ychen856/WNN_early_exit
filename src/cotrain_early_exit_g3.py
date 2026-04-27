@@ -741,4 +741,8 @@ if __name__ == "__main__":
     print(f"[G3 Overall@thr=2.0] test_acc={m['overall_acc']*100:.2f}%, exit_rate={m['exit_rate']*100:.2f}%")
 
 
-    
+    best, dbg = sweep_cascade_by_quantile(
+        model=model,
+        val_loader=val_loader,
+        device=device,
+    )
