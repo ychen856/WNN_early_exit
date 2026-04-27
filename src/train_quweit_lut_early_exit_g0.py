@@ -645,6 +645,182 @@ def eval_cascade(model, loader, device, *, exit_heads: List[torch.nn.Module], ex
     }
 
 
+@torch.no_grad()
+def collect_cascade_cache(
+    model,
+    loader,
+    device,
+    *,
+    exit_heads: List[torch.nn.Module],
+    exit_cfg_list: List[dict],
+):
+    num_exits = len(exit_heads)
+    model.eval()
+    exit_heads = [head.to(device).eval() for head in exit_heads]
+    labels_parts = []
+    final_pred_parts = []
+    exit_pred_parts = [[] for _ in range(num_exits)]
+    margins_per_exit = [[] for _ in range(num_exits)]
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        final_logits, h_list = forward_with_all_hidden(model, xb)
+        labels_parts.append(yb.cpu())
+        final_pred_parts.append(final_logits.argmax(dim=-1).cpu())
+        for exit_id in range(num_exits):
+            layer_idx = int(exit_cfg_list[exit_id]["layer_idx"])
+            logits = exit_heads[exit_id](h_list[layer_idx - 1]) / float(exit_cfg_list[exit_id].get("exit_tau", 1.0))
+            exit_pred_parts[exit_id].append(logits.argmax(dim=-1).cpu())
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            margins_per_exit[exit_id].append((top2[:, 0] - top2[:, 1]).detach().cpu())
+
+    return {
+        "labels": torch.cat(labels_parts, dim=0) if labels_parts else torch.empty(0, dtype=torch.long),
+        "final_pred": torch.cat(final_pred_parts, dim=0) if final_pred_parts else torch.empty(0, dtype=torch.long),
+        "exit_pred": [torch.cat(parts, dim=0) if parts else torch.empty(0, dtype=torch.long) for parts in exit_pred_parts],
+        "margins": [torch.cat(parts, dim=0) if parts else torch.empty(0) for parts in margins_per_exit],
+    }
+
+
+def eval_overall_at_thr_cached(cache: dict, profile: dict, thr: float, *, exit_id: int):
+    labels = cache["labels"]
+    final_pred = cache["final_pred"]
+    exit_pred = cache["exit_pred"][exit_id]
+    margins = cache["margins"][exit_id]
+    layer_idx = int(profile["exit_heads"][exit_id]["layer_idx"])
+    exit_profile = profile["exit_heads"][exit_id]
+
+    exit_mask = margins > float(thr)
+    preds = final_pred.clone()
+    preds[exit_mask] = exit_pred[exit_mask]
+
+    total = int(labels.numel())
+    exited = int(exit_mask.sum().item())
+    non_exited = total - exited
+    correct_overall = int((preds == labels).sum().item())
+    correct_exited = int((exit_pred[exit_mask] == labels[exit_mask]).sum().item()) if exited > 0 else 0
+    correct_non_exited = int((final_pred[~exit_mask] == labels[~exit_mask]).sum().item()) if non_exited > 0 else 0
+
+    batch_size = float(total)
+    non_exited_batch = float(non_exited)
+    prefix_flops = profile["patch_embed"]["flops"] + sum(layer["flops"] for layer in profile["layers"][:layer_idx])
+    prefix_macs = profile["patch_embed"]["macs"] + sum(layer["macs"] for layer in profile["layers"][:layer_idx])
+    tail_flops = sum(layer["flops"] for layer in profile["layers"][layer_idx:]) + profile["final_head"]["flops"]
+    tail_macs = sum(layer["macs"] for layer in profile["layers"][layer_idx:]) + profile["final_head"]["macs"]
+    total_flops = batch_size * (prefix_flops + exit_profile["flops"]) + non_exited_batch * tail_flops
+    total_macs = batch_size * (prefix_macs + exit_profile["macs"]) + non_exited_batch * tail_macs
+    total_layers = batch_size * float(layer_idx) + non_exited_batch * float(profile["num_backbone_layers"] - layer_idx)
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+
+    return {
+        "overall_acc": correct_overall / max(total, 1),
+        "exit_rate": exited / max(total, 1),
+        "exited_acc": correct_exited / max(exited, 1),
+        "non_exited_acc": (correct_non_exited / non_exited) if non_exited > 0 else float("nan"),
+        "margin_mean": float(margins.mean().item()) if margins.numel() > 0 else float("nan"),
+        "margin_p95": float(torch.quantile(margins, 0.95).item()) if margins.numel() > 0 else float("nan"),
+        "exited": exited,
+        "non_exited": non_exited,
+        "total": total,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan"),
+    }
+
+
+def eval_cascade_cached(cache: dict, profile: dict, thrs: List[float]):
+    labels = cache["labels"]
+    preds = cache["final_pred"].clone()
+    num_exits = len(cache["exit_pred"])
+    total = int(labels.numel())
+    undecided = torch.ones(total, dtype=torch.bool)
+    route_taken = torch.full((total,), fill_value=num_exits, dtype=torch.long)
+    n_exit = [0] * num_exits
+    c_exit = [0] * num_exits
+    margin_stats = []
+
+    for i in range(num_exits):
+        margins = cache["margins"][i]
+        take = undecided & (margins > float(thrs[i]))
+        if take.any():
+            preds[take] = cache["exit_pred"][i][take]
+            n_exit[i] = int(take.sum().item())
+            c_exit[i] = int((cache["exit_pred"][i][take] == labels[take]).sum().item())
+            route_taken[take] = i
+            taken_m = margins[take]
+        else:
+            taken_m = torch.empty(0)
+        undecided_m = margins[undecided]
+        margin_stats.append({
+            "undecided_mean": float(undecided_m.mean().item()) if undecided_m.numel() > 0 else float("nan"),
+            "undecided_p95": float(torch.quantile(undecided_m, 0.95).item()) if undecided_m.numel() > 0 else float("nan"),
+            "taken_mean": float(taken_m.mean().item()) if taken_m.numel() > 0 else float("nan"),
+            "taken_p95": float(torch.quantile(taken_m, 0.95).item()) if taken_m.numel() > 0 else float("nan"),
+        })
+        undecided = undecided & (~take)
+
+    n_final = int(undecided.sum().item())
+    c_final = int((preds[undecided] == labels[undecided]).sum().item()) if n_final > 0 else 0
+    correct = int((preds == labels).sum().item())
+
+    total_flops = 0.0
+    total_macs = 0.0
+    total_layers = 0.0
+    for route in range(num_exits):
+        count = float((route_taken == route).sum().item())
+        if count == 0:
+            continue
+        layer_idx = int(profile["exit_heads"][route]["layer_idx"])
+        flops = profile["patch_embed"]["flops"] + sum(layer["flops"] for layer in profile["layers"][:layer_idx])
+        macs = profile["patch_embed"]["macs"] + sum(layer["macs"] for layer in profile["layers"][:layer_idx])
+        flops += sum(h["flops"] for h in profile["exit_heads"][: route + 1])
+        macs += sum(h["macs"] for h in profile["exit_heads"][: route + 1])
+        total_flops += count * flops
+        total_macs += count * macs
+        total_layers += count * float(layer_idx)
+
+    final_count = float((route_taken == num_exits).sum().item())
+    if final_count > 0:
+        final_route_flops = profile["backbone_full_flops"] + sum(h["flops"] for h in profile["exit_heads"])
+        final_route_macs = profile["backbone_full_macs"] + sum(h["macs"] for h in profile["exit_heads"])
+        total_flops += final_count * final_route_flops
+        total_macs += final_count * final_route_macs
+        total_layers += final_count * float(profile["num_backbone_layers"])
+
+    avg_flops_per_sample = total_flops / max(total, 1)
+    avg_macs_per_sample = total_macs / max(total, 1)
+    avg_layers_executed_per_sample = total_layers / max(total, 1)
+    backbone_full_flops = float(profile["backbone_full_flops"])
+    compute_overhead_ratio = (avg_flops_per_sample / backbone_full_flops) if backbone_full_flops > 0 else float("nan")
+
+    return {
+        "overall_acc": correct / max(total, 1),
+        "total": total,
+        "exit_rates": [n / max(total, 1) for n in n_exit],
+        "exit_accs": [(c / n) if n > 0 else float("nan") for c, n in zip(c_exit, n_exit)],
+        "final_rate": n_final / max(total, 1),
+        "final_acc": (c_final / n_final) if n_final > 0 else float("nan"),
+        "margin_stats": margin_stats,
+        "avg_flops_per_sample": avg_flops_per_sample,
+        "avg_macs_per_sample": avg_macs_per_sample,
+        "avg_layers_executed_per_sample": avg_layers_executed_per_sample,
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": float(profile["total_exit_head_params"]),
+        "param_overhead_ratio": float(profile["param_overhead_ratio"]),
+        "compute_overhead_ratio": compute_overhead_ratio,
+        "compute_saving_ratio": 1.0 - compute_overhead_ratio if compute_overhead_ratio == compute_overhead_ratio else float("nan"),
+    }
+
+
 def print_single_exit_sweep(title: str, rows: List[dict]):
     print(f"\n=== {title} ===")
     header = (
@@ -696,29 +872,6 @@ def print_cascade_sweep(title: str, rows: List[dict]):
         )
 
 
-@torch.no_grad()
-def collect_exit_margins(model, loader, device, *, exit_heads: List[torch.nn.Module], exit_cfg_list: List[dict]):
-    num_exits = len(exit_heads)
-    margins_per_exit = [[] for _ in range(num_exits)]
-    model.eval()
-    exit_heads = [head.to(device).eval() for head in exit_heads]
-
-    for xb, _ in loader:
-        xb = xb.to(device)
-        _, h_list = forward_with_all_hidden(model, xb)
-        for exit_id in range(num_exits):
-            layer_idx = int(exit_cfg_list[exit_id]["layer_idx"])
-            logits = exit_heads[exit_id](h_list[layer_idx - 1])
-            top2 = torch.topk(logits, k=2, dim=-1).values
-            margins = top2[:, 0] - top2[:, 1]
-            margins_per_exit[exit_id].append(margins.detach().cpu())
-
-    out = []
-    for parts in margins_per_exit:
-        out.append(torch.cat(parts, dim=0) if parts else torch.empty(0))
-    return out
-
-
 def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> List[float]:
     if values.numel() == 0:
         return [0.0]
@@ -729,18 +882,8 @@ def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> Lis
     return uniq if uniq else [0.0]
 
 
-def sweep_cascade_by_quantile(
-    model,
-    val_loader,
-    test_loader,
-    device,
-    *,
-    exit_heads: List[torch.nn.Module],
-    exit_cfg_list: List[dict],
-    quantile_groups: List[List[float]],
-    test_top_k: int,
-):
-    margin_groups = collect_exit_margins(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list)
+def sweep_cascade_by_quantile(val_cache: dict, test_cache: dict, profile: dict, quantile_groups: List[List[float]], test_top_k: int):
+    margin_groups = val_cache["margins"]
     thr_groups = [
         _unique_quantile_values(margins, quantiles)
         for margins, quantiles in zip(margin_groups, quantile_groups)
@@ -752,13 +895,13 @@ def sweep_cascade_by_quantile(
     rows_val = []
     for thrs in itertools.product(*thr_groups):
         thrs = list(thrs)
-        rows_val.append({"thrs": thrs, **eval_cascade(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
+        rows_val.append({"thrs": thrs, **eval_cascade_cached(val_cache, profile, thrs)})
 
     rows_val.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
     rows_test = []
     for row in rows_val[:max(0, test_top_k)]:
         thrs = list(row["thrs"])
-        rows_test.append({"thrs": thrs, **eval_cascade(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=exit_cfg_list, thrs=thrs)})
+        rows_test.append({"thrs": thrs, **eval_cascade_cached(test_cache, profile, thrs)})
     rows_test.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
     return rows_val, rows_test, thr_groups, num_combinations
 
@@ -946,6 +1089,9 @@ def main():
         },
     )
     print(f"\n[saved] {args.path_out}")
+    profile = get_external_exit_profile(model, exit_heads, payload_exit_cfg)
+    val_cache = collect_cascade_cache(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
+    test_cache = collect_cascade_cache(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
 
     for exit_id, layer_idx in enumerate(exit_layers):
         rows_val = []
@@ -953,11 +1099,11 @@ def main():
         for thr in single_thr_list:
             rows_val.append({
                 "thr": thr,
-                **eval_overall_at_thr(model, val_loader, device, thr, exit_id=exit_id, exit_cfg_list=payload_exit_cfg, exit_heads=exit_heads),
+                **eval_overall_at_thr_cached(val_cache, profile, thr, exit_id=exit_id),
             })
             rows_test.append({
                 "thr": thr,
-                **eval_overall_at_thr(model, test_loader, device, thr, exit_id=exit_id, exit_cfg_list=payload_exit_cfg, exit_heads=exit_heads),
+                **eval_overall_at_thr_cached(test_cache, profile, thr, exit_id=exit_id),
             })
         print_single_exit_sweep(f"VAL single-exit sweep @ layer {layer_idx}", rows_val)
         print_single_exit_sweep(f"TEST single-exit sweep @ layer {layer_idx}", rows_test)
@@ -967,24 +1113,15 @@ def main():
         rows_test = []
         for thrs in itertools.product(*cascade_thr_grid):
             thrs = list(thrs)
-            rows_val.append({"thrs": thrs, **eval_cascade(model, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs)})
-            rows_test.append({"thrs": thrs, **eval_cascade(model, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg, thrs=thrs)})
+            rows_val.append({"thrs": thrs, **eval_cascade_cached(val_cache, profile, thrs)})
+            rows_test.append({"thrs": thrs, **eval_cascade_cached(test_cache, profile, thrs)})
         rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_sweep("VAL cascade sweep", rows_val)
         print_cascade_sweep("TEST cascade sweep", rows_test)
 
     if cascade_quantile_groups:
-        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(
-            model,
-            val_loader,
-            test_loader,
-            device,
-            exit_heads=exit_heads,
-            exit_cfg_list=payload_exit_cfg,
-            quantile_groups=cascade_quantile_groups,
-            test_top_k=args.sweep_top_k,
-        )
+        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(val_cache, test_cache, profile, cascade_quantile_groups, args.sweep_top_k)
         print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
