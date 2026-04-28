@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from src.core.multiLayerWNN import save_ckpt_v2
 from src.early_exit import _head_logits_from_hidden_trainable, lambda_schedule_linear
 from src.exit.ckpt_exit import ExitConfig
-from src.train_quweit_lut_early_exit_g0 import build_clean_cifar_loaders
+from src.train_quweit_lut_early_exit_g0 import build_clean_cifar_loaders, get_external_exit_profile
 from src.train_quweit_lut_early_exit_g2 import (
     _broadcast,
     _ensure_dir,
@@ -250,6 +250,7 @@ def main():
 
     model = model.to(device)
     exit_heads = [head.to(device) for head in exit_heads]
+    profile = get_external_exit_profile(model, exit_heads, payload_exit_cfg)
     val_cache = collect_cascade_cache_quweit(
         model,
         val_loader,
@@ -257,6 +258,7 @@ def main():
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
         use_prob_margin=args.use_prob_margin,
+        profile=profile,
     )
     test_cache = collect_cascade_cache_quweit(
         model,
@@ -265,6 +267,7 @@ def main():
         exit_heads=exit_heads,
         exit_cfg_list=payload_exit_cfg,
         use_prob_margin=args.use_prob_margin,
+        profile=profile,
     )
     print(f"\n[saved] {args.path_out}")
 
