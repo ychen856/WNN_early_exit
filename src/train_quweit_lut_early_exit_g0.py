@@ -942,11 +942,11 @@ def main():
     parser.add_argument("--path_out", type=str, required=True)
     parser.add_argument("--use_ema_backbone", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--exit_layers", type=str, default="2,4,6,8")
-    parser.add_argument("--k", type=str, default="256")
-    parser.add_argument("--keep_mode", type=str, default="p*(1-p)*std")
-    parser.add_argument("--exit_tau", type=str, default="1.0")
-    parser.add_argument("--init_thr", type=str, default="0.5")
+    parser.add_argument("--exit_layers", type=str, default="2,4,6,8", help='1-based exit layers, e.g. "2,4"')
+    parser.add_argument("--k", type=str, default="256", help='per-exit selected feature count; e.g. "192" or "128,192"')
+    parser.add_argument("--keep_mode", type=str, default="p*(1-p)*std", help='per-exit keep mode; broadcast supported')
+    parser.add_argument("--exit_tau", type=str, default="1.0", help='per-exit temperature; broadcast supported')
+    parser.add_argument("--init_thr", type=str, default="0.5", help='per-exit initial threshold; broadcast supported')
     parser.add_argument("--use_norm", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--epochs", type=int, default=20)
@@ -1001,6 +1001,20 @@ def main():
     single_thr_list = _parse_csv(args.single_thr_list, float)
     cascade_thr_grid = _parse_threshold_groups(args.cascade_thr_grid, len(exit_layers))
     cascade_quantile_groups = _parse_threshold_groups(args.cascade_quantiles, len(exit_layers))
+
+    hidden_dim = int(backbone_cfg.embed_dim)
+    bad_ks = [k for k in ks if k < 1 or k > hidden_dim]
+    if bad_ks:
+        raise ValueError(
+            f"Invalid --k values {bad_ks}; each exit head k must be in [1, {hidden_dim}] "
+            f"for this backbone (embed_dim={hidden_dim})."
+        )
+
+    print(
+        "[info] exit-head config "
+        f"layers={exit_layers} ks={ks} keep_modes={keep_modes} "
+        f"exit_taus={exit_taus} init_thrs={init_thrs}"
+    )
 
     exit_heads = []
     exit_cfg_list = []
