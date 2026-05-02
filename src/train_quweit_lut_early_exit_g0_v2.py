@@ -247,9 +247,9 @@ def resolve_exit_loss_setup(exit_layers):
     #    for layer_idx in exit_layers
     #}
     exit_loss_by_layer = {
-        1: {"mode": "baseline", "override": {}},
-        2: {"mode": "baseline", "override": {}},
-        3: {"mode": "baseline", "override": {}},
+        2: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
+        4: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
+        6: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         8: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
     }
 
