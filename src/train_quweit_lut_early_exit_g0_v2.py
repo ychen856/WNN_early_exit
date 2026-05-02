@@ -250,7 +250,7 @@ def resolve_exit_loss_setup(exit_layers):
         1: {"mode": "baseline", "override": {}},
         2: {"mode": "baseline", "override": {}},
         3: {"mode": "baseline", "override": {}},
-        4: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
+        8: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
     }
 
     resolved = []
