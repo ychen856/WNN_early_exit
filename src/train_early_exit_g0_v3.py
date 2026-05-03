@@ -513,6 +513,46 @@ def resolve_exit_loss_setup(exit_layers):
         #    'kd_T': 2.0,
         #    'lambda_kd': 0.7,
         #}},
+        #1: {'mode': 'kd_margin', 'override': {
+        #    'kd_T': 2.0,
+        #    'lambda_kd': 0.5,
+        #    'lambda_margin_pos': 0.1,
+        #    'lambda_margin_neg': 0.2,
+        #}},
+    }
+
+    # CE + KD
+    ''' exit_loss_by_layer = {
+        0: {'mode': 'kd', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+        1: {'mode': 'kd', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+    }'''
+
+    # CE + KD + final
+    '''exit_loss_by_layer = {
+        0: {'mode': 'kd_final_correct', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+        1: {'mode': 'kd_final_correct', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+    }'''
+
+    # CE + KD + margin
+    exit_loss_by_layer = {
+        0: {'mode': 'kd_margin', 'override': {
+            'kd_T': 2.0,
+            'lambda_kd': 0.5,
+            'lambda_margin_pos': 0.1,
+            'lambda_margin_neg': 0.2,
+        }},
         1: {'mode': 'kd_margin', 'override': {
             'kd_T': 2.0,
             'lambda_kd': 0.5,
