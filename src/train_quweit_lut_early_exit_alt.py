@@ -947,6 +947,8 @@ def main():
     parser.add_argument("--max_overall_drop", type=float, default=0.005)
     parser.add_argument("--max_tail_drop", type=float, default=0.01)
     parser.add_argument("--min_exit_accs", type=str, default="0.98,0.98")
+    parser.add_argument("--sweep_selection_baseline_overall", type=float, default=94.71,
+                        help="Baseline overall accuracy in percent for sweep selection constraints")
     parser.add_argument("--single_thr_list", type=str, default="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,5.0,6.0")
     parser.add_argument("--cascade_thr_grid", type=str, default="")
     parser.add_argument("--cascade_quantiles", type=str, default="0.0,0.25,0.5,0.75,0.9,0.95")
@@ -1069,6 +1071,11 @@ def main():
         f"train_exit_ids={list(train_exit_layer_ids)} "
         f"lr_backbone_F={alt_cfg.lr_backbone_F} lr_classifier_F={alt_cfg.lr_classifier_F} "
         f"lr_exits_H={alt_cfg.lr_exits_H}"
+    )
+    sweep_selection_baseline_overall = float(args.sweep_selection_baseline_overall) / 100.0
+    print(
+        f"[info] sweep selection baseline overall={args.sweep_selection_baseline_overall:.2f}% "
+        f"(cuts: {(sweep_selection_baseline_overall - 0.005) * 100:.2f}%, {(sweep_selection_baseline_overall - 0.010) * 100:.2f}%)"
     )
 
     baseline_eval = evaluate_multi_exit_bundle_quweit(
@@ -1208,7 +1215,7 @@ def main():
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_quantile_sweep("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade grid sweep", rows_test, top_k=args.sweep_top_k)
-        selected_rows = select_sweep_rows(rows_val, baseline_overall)
+        selected_rows = select_sweep_rows(rows_val, sweep_selection_baseline_overall)
         row_map_test = {tuple(float(x) for x in row["thrs"]): row for row in rows_test}
         print_sweep_selections("Sweep Test Selection (Grid)", selected_rows, row_map_test)
 
@@ -1218,7 +1225,7 @@ def main():
             test_cache,
             cascade_quantile_groups,
             args.sweep_top_k,
-            baseline_overall,
+            sweep_selection_baseline_overall,
         )
         print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
