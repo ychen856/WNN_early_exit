@@ -522,7 +522,7 @@ def resolve_exit_loss_setup(exit_layers):
     }
 
     # CE + KD
-    ''' exit_loss_by_layer = {
+    exit_loss_by_layer = {
         0: {'mode': 'kd', 'override': {
             "kd_T": 2.0,
             "lambda_kd": 0.7,
@@ -531,7 +531,7 @@ def resolve_exit_loss_setup(exit_layers):
             "kd_T": 2.0,
             "lambda_kd": 0.7,
         }},
-    }'''
+    }
 
     # CE + KD + final
     '''exit_loss_by_layer = {
@@ -546,7 +546,7 @@ def resolve_exit_loss_setup(exit_layers):
     }'''
 
     # CE + KD + margin
-    exit_loss_by_layer = {
+    '''exit_loss_by_layer = {
         0: {'mode': 'kd_margin', 'override': {
             'kd_T': 2.0,
             'lambda_kd': 0.5,
@@ -559,7 +559,7 @@ def resolve_exit_loss_setup(exit_layers):
             'lambda_margin_pos': 0.1,
             'lambda_margin_neg': 0.2,
         }},
-    }
+    }'''
 
     resolved = []
     for layer_idx in exit_layers:
