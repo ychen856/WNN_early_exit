@@ -828,9 +828,10 @@ def main():
     parser.add_argument("--epochs_H", type=int, default=1)
     parser.add_argument("--final_train_layers", type=str, default="11", help='0-based block ids for F phase, e.g. "11" or "10,11"')
     parser.add_argument("--train_exit_ids", type=str, default="", help='0-based exit ids for H phase; empty means all exits')
-    parser.add_argument("--lr_backbone_F", type=float, default=1e-5)
+    parser.add_argument("--train_classifier", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lr_backbone_F", type=float, default=1e-7)
     parser.add_argument("--lr_classifier_F", type=float, default=1e-5)
-    parser.add_argument("--lr_exits_H", type=float, default=5e-5)
+    parser.add_argument("--lr_exits_H", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--thr", type=str, default="", help='comma-separated thresholds per exit; empty means use g0 checkpoint values')
@@ -924,7 +925,7 @@ def main():
         epochs_F=args.epochs_F,
         epochs_H=args.epochs_H,
         final_train_layers=final_train_layers,
-        final_train_classifier=True,
+        final_train_classifier=bool(args.train_classifier),
         train_exit_ids=tuple(train_exit_ids),
         lr_backbone_F=args.lr_backbone_F,
         lr_classifier_F=args.lr_classifier_F,
@@ -937,7 +938,8 @@ def main():
     print("[info] alternating plan")
     print(
         f"  cycles={alt_cfg.cycles} epochs_F={alt_cfg.epochs_F} epochs_H={alt_cfg.epochs_H} "
-        f"final_layers={list(alt_cfg.final_train_layers)} train_exit_ids={list(alt_cfg.train_exit_ids)} "
+        f"final_layers={list(alt_cfg.final_train_layers)} train_classifier={alt_cfg.final_train_classifier} "
+        f"train_exit_ids={list(alt_cfg.train_exit_ids)} "
         f"lr_backbone_F={alt_cfg.lr_backbone_F} lr_classifier_F={alt_cfg.lr_classifier_F} "
         f"lr_exits_H={alt_cfg.lr_exits_H}"
     )
@@ -1010,6 +1012,7 @@ def main():
             "epochs_F": int(args.epochs_F),
             "epochs_H": int(args.epochs_H),
             "final_train_layers": list(final_train_layers),
+            "train_classifier": bool(args.train_classifier),
             "train_exit_ids": list(train_exit_ids),
             "lr_backbone_F": float(args.lr_backbone_F),
             "lr_classifier_F": float(args.lr_classifier_F),
