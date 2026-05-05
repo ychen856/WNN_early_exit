@@ -1092,8 +1092,8 @@ def main():
     parser.add_argument(
         "--min_exit_accs_select",
         type=str,
-        default="0.90,0.93,0.95,0.98",
-        help="comma-separated min exit accs for threshold selection"
+        default=None,
+        help="Comma-separated minimum exit accuracies used for final sweep selection."
     )
     parser.add_argument(
         "--min_exit_rates_select",
@@ -1180,7 +1180,10 @@ def main():
     min_exit_accs = tuple(float(x) for x in min_exit_accs_raw)
     num_exits = len(exit_heads)
     max_exit_rates = parse_float_list(args.max_exit_rates, num_exits, "max_exit_rates")
-    min_exit_accs_select = parse_float_list(args.min_exit_accs_select, num_exits, "min_exit_accs_select")
+    if args.min_exit_accs_select is not None:
+        min_exit_accs_select = parse_float_list(args.min_exit_accs_select, num_exits, "min_exit_accs_select")
+    else:
+        min_exit_accs_select = list(min_exit_accs)
     min_exit_rates_select = parse_float_list(args.min_exit_rates_select, num_exits, "min_exit_rates_select")
     '''exit_loss_by_layer = {
         int(cfg["layer_idx"]) - 1: {"mode": "kd_final_correct", "override": {"kd_T": 2.0, "lambda_kd": 0.7}}
