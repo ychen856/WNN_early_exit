@@ -940,7 +940,7 @@ def main():
         num_blocks=len(backbone.blocks),
         name="F-phase layer",
     )
-
+    print('num_blocks in backbone:', len(backbone.blocks))
     combo_metric_weights = tuple(_parse_csv(args.combo_metric_weights, float))
     if len(combo_metric_weights) != 3:
         raise ValueError("--combo_metric_weights must have exactly 3 values")
