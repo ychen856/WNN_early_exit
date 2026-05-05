@@ -77,6 +77,37 @@ def _safe_float(x: float, fallback: float = 0.0) -> float:
     return fallback if x != x else x
 
 
+def _validate_backbone_layer_indices(layer_ids: Sequence[int], *, num_blocks: int, name: str) -> List[int]:
+    resolved = []
+    for layer_id in layer_ids:
+        layer_id = int(layer_id)
+        if layer_id < 0 or layer_id >= num_blocks:
+            raise ValueError(f"Invalid {name} {layer_id}; expected 0-based index in [0, {num_blocks - 1}]")
+        resolved.append(layer_id)
+    return resolved
+
+
+def _resolve_exit_ids_to_indices(train_exit_ids: Sequence[int], payload_exit_cfg: List[dict]) -> Tuple[List[int], List[int]]:
+    exit_layer_ids = [int(cfg["layer_idx"]) for cfg in payload_exit_cfg]
+    layer_id_to_index = {layer_id: idx for idx, layer_id in enumerate(exit_layer_ids)}
+
+    resolved_indices = []
+    resolved_layer_ids = []
+    for exit_id in train_exit_ids:
+        exit_id = int(exit_id)
+        if exit_id in layer_id_to_index:
+            idx = layer_id_to_index[exit_id]
+        elif 0 <= exit_id < len(payload_exit_cfg):
+            idx = exit_id
+        else:
+            raise ValueError(
+                f"Invalid train exit id {exit_id}; expected one of layer ids {exit_layer_ids}"
+            )
+        resolved_indices.append(idx)
+        resolved_layer_ids.append(exit_layer_ids[idx])
+    return resolved_indices, resolved_layer_ids
+
+
 def forward_with_all_hidden(model: QuWeiTViT, x: torch.Tensor):
     out = model(x, return_intermediate=True)
     final_logits = out["logits"]
@@ -826,8 +857,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--epochs_F", type=int, default=1)
     parser.add_argument("--epochs_H", type=int, default=1)
-    parser.add_argument("--final_train_layers", type=str, default="11", help='0-based block ids for F phase, e.g. "11" or "10,11"')
-    parser.add_argument("--train_exit_ids", type=str, default="", help='0-based exit ids for H phase; empty means all exits')
+    parser.add_argument("--final_train_layers", type=str, default="11", help='0-based backbone block indices for F phase, e.g. "11" or "10,11"')
+    parser.add_argument("--train_exit_ids", type=str, default="", help='exit ids following backbone layer naming, e.g. "2,4,6,8"; empty means all exits')
     parser.add_argument("--train_classifier", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr_backbone_F", type=float, default=1e-7)
     parser.add_argument("--lr_classifier_F", type=float, default=1e-5)
@@ -893,22 +924,22 @@ def main():
     cascade_quantile_groups = _parse_threshold_groups(args.cascade_quantiles, len(payload_exit_cfg), "cascade_quantiles")
 
     if args.train_exit_ids.strip():
-        train_exit_ids = _parse_csv(args.train_exit_ids, int)
+        train_exit_ids_input = _parse_csv(args.train_exit_ids, int)
     else:
-        train_exit_ids = list(range(len(exit_heads)))
-    if not train_exit_ids:
+        train_exit_ids_input = [int(cfg["layer_idx"]) for cfg in payload_exit_cfg]
+    if not train_exit_ids_input:
         raise ValueError("No exits selected for H phase.")
-    for exit_id in train_exit_ids:
-        if exit_id < 0 or exit_id >= len(exit_heads):
-            raise ValueError(f"Invalid train exit id {exit_id}; num_exits={len(exit_heads)}")
+    train_exit_indices, train_exit_layer_ids = _resolve_exit_ids_to_indices(train_exit_ids_input, payload_exit_cfg)
 
     if args.final_train_layers.strip():
-        final_train_layers = _parse_csv(args.final_train_layers, int)
+        final_train_layers_input = _parse_csv(args.final_train_layers, int)
     else:
-        final_train_layers = []
-    for layer_idx in final_train_layers:
-        if layer_idx < 0 or layer_idx >= len(backbone.blocks):
-            raise ValueError(f"Invalid F-phase layer {layer_idx}; depth={len(backbone.blocks)}")
+        final_train_layers_input = []
+    final_train_layers = _validate_backbone_layer_indices(
+        final_train_layers_input,
+        num_blocks=len(backbone.blocks),
+        name="F-phase layer",
+    )
 
     combo_metric_weights = tuple(_parse_csv(args.combo_metric_weights, float))
     if len(combo_metric_weights) != 3:
@@ -926,7 +957,7 @@ def main():
         epochs_H=args.epochs_H,
         final_train_layers=final_train_layers,
         final_train_classifier=bool(args.train_classifier),
-        train_exit_ids=tuple(train_exit_ids),
+        train_exit_ids=tuple(train_exit_indices),
         lr_backbone_F=args.lr_backbone_F,
         lr_classifier_F=args.lr_classifier_F,
         lr_exits_H=args.lr_exits_H,
@@ -938,8 +969,8 @@ def main():
     print("[info] alternating plan")
     print(
         f"  cycles={alt_cfg.cycles} epochs_F={alt_cfg.epochs_F} epochs_H={alt_cfg.epochs_H} "
-        f"final_layers={list(alt_cfg.final_train_layers)} train_classifier={alt_cfg.final_train_classifier} "
-        f"train_exit_ids={list(alt_cfg.train_exit_ids)} "
+        f"final_layers={list(final_train_layers_input)} train_classifier={alt_cfg.final_train_classifier} "
+        f"train_exit_ids={list(train_exit_layer_ids)} "
         f"lr_backbone_F={alt_cfg.lr_backbone_F} lr_classifier_F={alt_cfg.lr_classifier_F} "
         f"lr_exits_H={alt_cfg.lr_exits_H}"
     )
@@ -1011,9 +1042,11 @@ def main():
             "cycles": int(args.cycles),
             "epochs_F": int(args.epochs_F),
             "epochs_H": int(args.epochs_H),
-            "final_train_layers": list(final_train_layers),
+            "final_train_layers": list(final_train_layers_input),
+            "final_train_layer_indices": list(final_train_layers),
             "train_classifier": bool(args.train_classifier),
-            "train_exit_ids": list(train_exit_ids),
+            "train_exit_ids": list(train_exit_layer_ids),
+            "train_exit_indices": list(train_exit_indices),
             "lr_backbone_F": float(args.lr_backbone_F),
             "lr_classifier_F": float(args.lr_classifier_F),
             "lr_exits_H": float(args.lr_exits_H),
