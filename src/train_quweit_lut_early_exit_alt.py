@@ -494,7 +494,66 @@ def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> Lis
     return uniq if uniq else [0.0]
 
 
-def sweep_cascade_by_quantile(val_cache: dict, test_cache: dict, quantile_groups: List[List[float]], test_top_k: int):
+def _sort_rows_for_efficiency(rows: List[dict]) -> List[dict]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["avg_flops_per_sample"],
+            row["avg_layers_executed_per_sample"],
+            -row["overall_acc"],
+        ),
+    )
+
+
+def select_sweep_rows(rows_val: List[dict], baseline_overall: float):
+    selected = []
+
+    if rows_val:
+        best_overall = max(rows_val, key=lambda row: (row["overall_acc"], -row["avg_flops_per_sample"]))
+        selected.append(("best overall", best_overall, None))
+
+    for drop in (0.005, 0.010):
+        min_overall = float(baseline_overall) - float(drop)
+        feasible = [row for row in rows_val if row["overall_acc"] >= min_overall]
+        if feasible:
+            best_eff = _sort_rows_for_efficiency(feasible)[0]
+            selected.append((f"best efficiency @ overall >= baseline - {drop * 100:.1f}%", best_eff, min_overall))
+        else:
+            selected.append((f"best efficiency @ overall >= baseline - {drop * 100:.1f}%", None, min_overall))
+
+    return selected
+
+
+def print_sweep_selections(title: str, selected_rows, row_map_test: Dict[Tuple[float, ...], dict]):
+    print(f"\n=== {title} ===")
+    for label, row_val, min_overall in selected_rows:
+        if row_val is None:
+            cutoff_text = f"{min_overall * 100:.2f}%" if min_overall is not None else "n/a"
+            print(f"[{label}] no VAL candidate meets cutoff {cutoff_text}")
+            continue
+
+        key = tuple(float(x) for x in row_val["thrs"])
+        row_test = row_map_test.get(key)
+        thr_text = [round(float(x), 4) for x in row_val["thrs"]]
+        print(
+            f"[{label}] VAL overall={row_val['overall_acc'] * 100:.2f}% "
+            f"avgFLOPs={row_val['avg_flops_per_sample']:.0f} final_rate={row_val['final_rate']:.4f} "
+            f"thrs={thr_text}"
+        )
+        if row_test is not None:
+            print(
+                f"           TEST overall={row_test['overall_acc'] * 100:.2f}% "
+                f"avgFLOPs={row_test['avg_flops_per_sample']:.0f} final_rate={row_test['final_rate']:.4f}"
+            )
+
+
+def sweep_cascade_by_quantile(
+    val_cache: dict,
+    test_cache: dict,
+    quantile_groups: List[List[float]],
+    test_top_k: int,
+    baseline_overall: float,
+):
     margin_groups = val_cache["margins"]
     thr_groups = [
         _unique_quantile_values(margins, quantiles)
@@ -510,12 +569,28 @@ def sweep_cascade_by_quantile(val_cache: dict, test_cache: dict, quantile_groups
         rows_val.append({"thrs": thrs, **eval_cascade_cached_quweit(val_cache, thrs)})
 
     rows_val.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
+    selected_rows = select_sweep_rows(rows_val, baseline_overall)
+
+    selected_thrs = {
+        tuple(float(x) for x in row["thrs"])
+        for _, row, _ in selected_rows
+        if row is not None
+    }
+    top_k_thrs = {
+        tuple(float(x) for x in row["thrs"])
+        for row in rows_val[:max(0, test_top_k)]
+    }
+    test_thrs_set = selected_thrs | top_k_thrs
+
     rows_test = []
-    for row in rows_val[:max(0, test_top_k)]:
+    for row in rows_val:
+        key = tuple(float(x) for x in row["thrs"])
+        if key not in test_thrs_set:
+            continue
         thrs = list(row["thrs"])
         rows_test.append({"thrs": thrs, **eval_cascade_cached_quweit(test_cache, thrs)})
     rows_test.sort(key=lambda row: (-row["overall_acc"], row["avg_flops_per_sample"]))
-    return rows_val, rows_test, thr_groups, num_combinations
+    return rows_val, rows_test, thr_groups, num_combinations, selected_rows
 
 
 def print_cascade_quantile_sweep(title: str, rows: List[dict], top_k: int = 20):
@@ -947,10 +1022,31 @@ def main():
 
     min_exit_accs_raw = _broadcast(_parse_csv(args.min_exit_accs, float), len(exit_heads), "min_exit_accs")
     min_exit_accs = tuple(float(x) for x in min_exit_accs_raw)
-    exit_loss_by_layer = {
+    '''exit_loss_by_layer = {
         int(cfg["layer_idx"]) - 1: {"mode": "kd_final_correct", "override": {"kd_T": 2.0, "lambda_kd": 0.7}}
         for cfg in payload_exit_cfg
-    }
+    }'''
+    exit_loss_by_layer = {}
+    for cfg in payload_exit_cfg:
+        li_1based = int(cfg["layer_idx"])
+        li0 = li_1based - 1
+
+        if li_1based in (2, 4, 6):
+            exit_loss_by_layer[li0] = {
+                "mode": "kd",
+                "override": {"kd_T": 2.0, "lambda_kd": 0.7},
+            }
+        elif li_1based == 8:
+            exit_loss_by_layer[li0] = {
+                "mode": "baseline",
+                "override": {},
+            }
+        else:
+            exit_loss_by_layer[li0] = {
+                "mode": "baseline",
+                "override": {},
+            }
+
     alt_cfg = AlternatingPhaseConfig(
         cycles=args.cycles,
         epochs_F=args.epochs_F,
@@ -1112,12 +1208,23 @@ def main():
         rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
         print_cascade_quantile_sweep("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade grid sweep", rows_test, top_k=args.sweep_top_k)
+        selected_rows = select_sweep_rows(rows_val, baseline_overall)
+        row_map_test = {tuple(float(x) for x in row["thrs"]): row for row in rows_test}
+        print_sweep_selections("Sweep Test Selection (Grid)", selected_rows, row_map_test)
 
     if cascade_quantile_groups:
-        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(val_cache, test_cache, cascade_quantile_groups, args.sweep_top_k)
+        rows_val, rows_test, thr_groups, num_combinations, selected_rows = sweep_cascade_by_quantile(
+            val_cache,
+            test_cache,
+            cascade_quantile_groups,
+            args.sweep_top_k,
+            baseline_overall,
+        )
         print(f"[quantile-sweep] num_combinations={num_combinations}")
         print_cascade_quantile_sweep("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
         print_cascade_quantile_sweep("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
+        row_map_test = {tuple(float(x) for x in row["thrs"]): row for row in rows_test}
+        print_sweep_selections("Sweep Test Selection (Quantile)", selected_rows, row_map_test)
 
 
 if __name__ == "__main__":
