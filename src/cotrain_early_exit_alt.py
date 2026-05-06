@@ -1,5 +1,7 @@
 import argparse
 import copy
+import itertools
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -102,6 +104,28 @@ def _resolve_gate_T(gate_T: Optional[Sequence[float]], num_exits: int) -> List[f
     if len(gate_T) != num_exits:
         raise ValueError(f"gate_T must match num_exits, got {len(gate_T)} vs {num_exits}")
     return [float(x) for x in gate_T]
+
+
+def parse_float_list(s: str, n: Optional[int] = None, name: str = "list") -> List[float]:
+    vals = [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+    if n is not None and len(vals) != n:
+        raise ValueError(f"{name} must have length {n}, got {len(vals)}: {vals}")
+    return vals
+
+
+def _parse_threshold_groups(s: str, num_exits: int, name: str) -> List[List[float]]:
+    if not s.strip():
+        return []
+    groups = []
+    for chunk in s.split(";"):
+        chunk = chunk.strip()
+        if chunk:
+            groups.append(parse_float_list(chunk, name=name))
+    if len(groups) == 1:
+        return groups * num_exits
+    if len(groups) != num_exits:
+        raise ValueError(f"{name} expects 1 group or {num_exits} groups, got {len(groups)}")
+    return groups
 
 
 def _safe_float(x: float, fallback: float = 0.0) -> float:
@@ -512,6 +536,269 @@ def compute_selection_metric(
     if baseline_tail_acc is not None and final_tail < float(baseline_tail_acc) - float(max_tail_drop):
         return -1.0
     return metric
+
+
+def _sort_rows_for_efficiency(rows: List[dict]) -> List[dict]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["raw"].get("exp_layers", float("inf")),
+            row["final_rate"],
+            -row["overall_acc"],
+        ),
+    )
+
+
+def row_passes_selection_constraints(
+    row,
+    *,
+    min_overall=None,
+    min_final_rate=None,
+    max_exit_rates=None,
+    min_exit_rates=None,
+    min_exit_accs=None,
+):
+    overall = float(row["overall_acc"])
+    final_rate = float(row["final_rate"])
+    exit_rates = row["exit_rates"]
+    exit_accs = row["exit_accs"]
+    if min_overall is not None and overall < min_overall:
+        return False
+    if min_final_rate is not None and final_rate < min_final_rate:
+        return False
+    if max_exit_rates is not None:
+        for r, max_r in zip(exit_rates, max_exit_rates):
+            if max_r is not None and r > max_r:
+                return False
+    if min_exit_rates is not None:
+        for r, min_r in zip(exit_rates, min_exit_rates):
+            if min_r is not None and r < min_r:
+                return False
+    if min_exit_accs is not None and exit_accs is not None:
+        for r, a, min_a in zip(exit_rates, exit_accs, min_exit_accs):
+            if r <= 1e-8:
+                continue
+            if min_a is not None and (a is None or math.isnan(float(a)) or float(a) < min_a):
+                return False
+    return True
+
+
+def select_best_efficiency_constrained(
+    rows,
+    *,
+    baseline_overall,
+    drop_pp,
+    min_final_rate,
+    max_exit_rates,
+    min_exit_rates,
+    min_exit_accs,
+):
+    cutoff = float(baseline_overall) - float(drop_pp) / 100.0
+    candidates = []
+    for row in rows:
+        if row_passes_selection_constraints(
+            row,
+            min_overall=cutoff,
+            min_final_rate=min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates,
+            min_exit_accs=min_exit_accs,
+        ):
+            candidates.append(row)
+    if len(candidates) == 0:
+        return None, cutoff, 0
+    best = _sort_rows_for_efficiency(candidates)[0]
+    return best, cutoff, len(candidates)
+
+
+def select_sweep_rows(
+    rows_val: List[dict],
+    baseline_overall: float,
+    *,
+    min_final_rate: Optional[float],
+    max_exit_rates: Optional[Sequence[Optional[float]]],
+    min_exit_rates: Optional[Sequence[Optional[float]]],
+    min_exit_accs: Optional[Sequence[Optional[float]]],
+):
+    selected = []
+    if rows_val:
+        best_overall = max(rows_val, key=lambda row: (row["overall_acc"], -row["raw"].get("exp_layers", float("inf"))))
+        selected.append(("best overall", best_overall, None, None))
+
+    for drop_pp in (0.5, 1.0):
+        min_overall = float(baseline_overall) - float(drop_pp) / 100.0
+        feasible = [row for row in rows_val if row["overall_acc"] >= min_overall]
+        if feasible:
+            best_eff = _sort_rows_for_efficiency(feasible)[0]
+            selected.append((f"best efficiency unconstrained @ overall >= baseline - {drop_pp:.1f}%", best_eff, min_overall, len(feasible)))
+        else:
+            selected.append((f"best efficiency unconstrained @ overall >= baseline - {drop_pp:.1f}%", None, min_overall, 0))
+
+        best_constrained, cutoff, count = select_best_efficiency_constrained(
+            rows_val,
+            baseline_overall=baseline_overall,
+            drop_pp=drop_pp,
+            min_final_rate=min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates,
+            min_exit_accs=min_exit_accs,
+        )
+        selected.append((f"best efficiency constrained @ overall >= baseline - {drop_pp:.1f}%", best_constrained, cutoff, count))
+    return selected
+
+
+def find_row_by_thrs(rows, thrs, tol=1e-4):
+    for row in rows:
+        row_thrs = row["thrs"]
+        if len(row_thrs) != len(thrs):
+            continue
+        if all(abs(float(a) - float(b)) <= tol for a, b in zip(row_thrs, thrs)):
+            return row
+    return None
+
+
+def print_sweep_selections(title: str, selected_rows, rows_test: List[dict]):
+    print(f"\n=== {title} ===")
+    for label, row_val, min_overall, candidate_count in selected_rows:
+        if row_val is None:
+            cutoff_text = f"{min_overall * 100:.2f}%" if min_overall is not None else "n/a"
+            print(f"[{label}] candidates={candidate_count} no VAL candidate meets cutoff {cutoff_text}")
+            continue
+
+        row_test = find_row_by_thrs(rows_test, row_val["thrs"])
+        exit_accs_val = [round(float(x), 4) if x == x else float("nan") for x in row_val["exit_accs"]]
+        print(
+            f"[{label}] VAL overall={row_val['overall_acc']*100:.2f}% "
+            f"exp_layers={row_val['raw'].get('exp_layers', float('nan')):.4f} "
+            f"final_rate={row_val['final_rate']:.4f} "
+            f"exit_rates={[round(float(x), 4) for x in row_val['exit_rates']]} "
+            f"exit_accs={exit_accs_val} "
+            f"thrs={[round(float(x), 4) for x in row_val['thrs']]}"
+        )
+        if candidate_count is not None and min_overall is not None:
+            print(f"           candidates={candidate_count} cutoff={min_overall*100:.2f}%")
+        if row_test is not None:
+            exit_accs_test = [round(float(x), 4) if x == x else float('nan') for x in row_test["exit_accs"]]
+            print(
+                f"           TEST overall={row_test['overall_acc']*100:.2f}% "
+                f"exp_layers={row_test['raw'].get('exp_layers', float('nan')):.4f} "
+                f"final_rate={row_test['final_rate']:.4f} "
+                f"exit_rates={[round(float(x), 4) for x in row_test['exit_rates']]} "
+                f"exit_accs={exit_accs_test}"
+            )
+
+
+def print_cascade_sweep_table(title: str, rows: List[dict], top_k: int = 20):
+    print(f"\n=== {title} ===")
+    if not rows:
+        print("(empty)")
+        return
+
+    num_exits = len(rows[0]["thrs"])
+    header_parts = [f"thr{i}" for i in range(num_exits)]
+    header_parts += ["overall%"]
+    for i in range(num_exits):
+        header_parts += [f"exit{i}_rate%", f"exit{i}_acc%"]
+    header_parts += ["final_rate%", "final_acc%", "expLayers"]
+    header = "  ".join(f"{item:>11s}" for item in header_parts)
+    print(header)
+    print("-" * len(header))
+
+    for row in rows[:top_k]:
+        values = [f"{float(thr):>11.4f}" for thr in row["thrs"]]
+        values.append(f"{row['overall_acc'] * 100:>11.2f}")
+        for rate, acc in zip(row["exit_rates"], row["exit_accs"]):
+            acc_text = f"{acc * 100:>11.2f}" if acc == acc else f"{'nan':>11s}"
+            values.append(f"{rate * 100:>11.2f}")
+            values.append(acc_text)
+        final_acc = row.get("final_acc", float("nan"))
+        final_acc_text = f"{final_acc * 100:>11.2f}" if final_acc == final_acc else f"{'nan':>11s}"
+        values.append(f"{row['final_rate'] * 100:>11.2f}")
+        values.append(final_acc_text)
+        values.append(f"{row['raw'].get('exp_layers', float('nan')):>11.4f}")
+        print("  ".join(values))
+
+
+def get_constrained_rows(
+    rows: List[dict],
+    *,
+    baseline_overall: float,
+    drop_pp: float,
+    min_final_rate: Optional[float],
+    max_exit_rates: Optional[Sequence[Optional[float]]],
+    min_exit_rates: Optional[Sequence[Optional[float]]],
+    min_exit_accs: Optional[Sequence[Optional[float]]],
+) -> Tuple[List[dict], float]:
+    cutoff = float(baseline_overall) - float(drop_pp) / 100.0
+    filtered = [
+        row
+        for row in rows
+        if row_passes_selection_constraints(
+            row,
+            min_overall=cutoff,
+            min_final_rate=min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates,
+            min_exit_accs=min_exit_accs,
+        )
+    ]
+    return _sort_rows_for_efficiency(filtered), cutoff
+
+
+def sweep_threshold_grid(
+    model,
+    val_loader,
+    test_loader,
+    device,
+    *,
+    exit_heads,
+    payload_exit_cfg,
+    threshold_groups: List[List[float]],
+    use_prob_margin: bool,
+):
+    rows_val = []
+    rows_test = []
+    for thrs in itertools.product(*threshold_groups):
+        thrs = list(thrs)
+        out_val = eval_cascade_multi_exit(
+            model,
+            val_loader,
+            device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            thrs=thrs,
+            use_prob_margin=use_prob_margin,
+            log_margins=False,
+        )
+        out_test = eval_cascade_multi_exit(
+            model,
+            test_loader,
+            device,
+            exit_heads=exit_heads,
+            exit_cfg_list=payload_exit_cfg,
+            thrs=thrs,
+            use_prob_margin=use_prob_margin,
+            log_margins=False,
+        )
+        rows_val.append({"thrs": thrs, **{
+            "overall_acc": float(out_val["overall_acc"]),
+            "exit_rates": list(out_val["exit_rates"]),
+            "exit_accs": list(out_val.get("exit_accs", [])),
+            "final_rate": float(out_val["final_rate"]),
+            "final_acc": float(out_val.get("final_acc", 0.0)),
+            "raw": out_val,
+        }})
+        rows_test.append({"thrs": thrs, **{
+            "overall_acc": float(out_test["overall_acc"]),
+            "exit_rates": list(out_test["exit_rates"]),
+            "exit_accs": list(out_test.get("exit_accs", [])),
+            "final_rate": float(out_test["final_rate"]),
+            "final_acc": float(out_test.get("final_acc", 0.0)),
+            "raw": out_test,
+        }})
+    rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
+    rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
+    return rows_val, rows_test
 
 
 def cotrain_g3_multi_exit_staged(
@@ -943,6 +1230,29 @@ if __name__ == "__main__":
     parser.add_argument("--use_norm", action="store_true", default=True)
     parser.add_argument("--thr", type=str, default="1.0,1.5",
                     help="comma-separated thresholds per exit, e.g. 1.0,1.5")
+    parser.add_argument("--cascade_thr_grid", type=str, default="")
+    parser.add_argument("--sweep_selection_baseline_overall", type=float, default=94.71,
+                        help="Baseline overall accuracy in percent for sweep selection constraints")
+    parser.add_argument("--min_final_rate", type=float, default=0.45)
+    parser.add_argument(
+        "--max_exit_rates",
+        type=str,
+        default="0.10,0.50",
+        help="comma-separated max exit rates for each exit head"
+    )
+    parser.add_argument(
+        "--min_exit_accs_select",
+        type=str,
+        default=None,
+        help="Comma-separated minimum exit accuracies used for final sweep selection."
+    )
+    parser.add_argument(
+        "--min_exit_rates_select",
+        type=str,
+        default="0.0,0.0",
+        help="optional comma-separated min exit rates; useful to avoid degenerate exits"
+    )
+    parser.add_argument("--sweep_top_k", type=int, default=20)
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1030,14 +1340,22 @@ if __name__ == "__main__":
 
     use_prob_margin = False
     exit_loss_by_layer = {
-        0: {"mode": "kd_final_correct", "override": {"kd_T": 2.0, "lambda_kd": 0.7}},
-        1: {"mode": "kd_final_correct", "override": {"kd_T": 2.0, "lambda_kd": 0.7}},
+        0: {"mode": "kd", "override": {"kd_T": 2.0, "lambda_kd": 0.7}},
+        1: {"mode": "kd", "override": {"kd_T": 2.0, "lambda_kd": 0.7}},
     }
     min_exit_accs = (0.98, 0.98)
 
     thrs_train = [float(x) for x in args.thr.split(",")]
     thrs_eval_list = [tuple(thrs_train)]
     thrs_tail_anchor = tuple(thrs_train)
+    cascade_thr_grid = _parse_threshold_groups(args.cascade_thr_grid, len(exit_heads), "cascade_thr_grid")
+    sweep_selection_baseline_overall = float(args.sweep_selection_baseline_overall) / 100.0
+    max_exit_rates = parse_float_list(args.max_exit_rates, len(exit_heads), "max_exit_rates")
+    if args.min_exit_accs_select is not None:
+        min_exit_accs_select = parse_float_list(args.min_exit_accs_select, len(exit_heads), "min_exit_accs_select")
+    else:
+        min_exit_accs_select = list(min_exit_accs)
+    min_exit_rates_select = parse_float_list(args.min_exit_rates_select, len(exit_heads), "min_exit_rates_select")
 
 
 
@@ -1107,6 +1425,86 @@ if __name__ == "__main__":
         extra={"dataset": args.dataset, "best_eval_record": best["selected"], "best_metric": best["metric"]},
     )
     print("\nSaved:", args.path_out)
+
+    if cascade_thr_grid:
+        print(
+            f"[info] sweep selection baseline overall={args.sweep_selection_baseline_overall:.2f}% "
+            f"(cuts: {(sweep_selection_baseline_overall - 0.005) * 100:.2f}%, {(sweep_selection_baseline_overall - 0.010) * 100:.2f}%)"
+        )
+        print(
+            f"[info] selection constraints min_final_rate={args.min_final_rate:.4f} "
+            f"max_exit_rates={max_exit_rates} min_exit_rates={min_exit_rates_select} "
+            f"min_exit_accs_select={min_exit_accs_select}"
+        )
+        rows_val, rows_test = sweep_threshold_grid(
+            backbone,
+            val_loader,
+            test_loader,
+            device,
+            exit_heads=exit_heads,
+            payload_exit_cfg=model_cfg.payload_exit_cfg,
+            threshold_groups=cascade_thr_grid,
+            use_prob_margin=use_prob_margin,
+        )
+        print_cascade_sweep_table("VAL cascade grid sweep", rows_val, top_k=args.sweep_top_k)
+        print_cascade_sweep_table("TEST cascade grid sweep", rows_test, top_k=args.sweep_top_k)
+        constrained_rows_05, cutoff_05 = get_constrained_rows(
+            rows_val,
+            baseline_overall=sweep_selection_baseline_overall,
+            drop_pp=0.5,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        constrained_rows_10, cutoff_10 = get_constrained_rows(
+            rows_val,
+            baseline_overall=sweep_selection_baseline_overall,
+            drop_pp=1.0,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        print_cascade_sweep_table(
+            f"VAL constrained efficiency top-k @ overall >= {cutoff_05 * 100:.2f}%",
+            constrained_rows_05,
+            top_k=args.sweep_top_k,
+        )
+        print_cascade_sweep_table(
+            f"VAL constrained efficiency top-k @ overall >= {cutoff_10 * 100:.2f}%",
+            constrained_rows_10,
+            top_k=args.sweep_top_k,
+        )
+        constrained_test_rows_05 = []
+        for row in constrained_rows_05:
+            matched = find_row_by_thrs(rows_test, row["thrs"])
+            if matched is not None:
+                constrained_test_rows_05.append(matched)
+        constrained_test_rows_10 = []
+        for row in constrained_rows_10:
+            matched = find_row_by_thrs(rows_test, row["thrs"])
+            if matched is not None:
+                constrained_test_rows_10.append(matched)
+        print_cascade_sweep_table(
+            f"TEST constrained efficiency top-k @ overall >= {cutoff_05 * 100:.2f}% (by VAL selection)",
+            constrained_test_rows_05,
+            top_k=args.sweep_top_k,
+        )
+        print_cascade_sweep_table(
+            f"TEST constrained efficiency top-k @ overall >= {cutoff_10 * 100:.2f}% (by VAL selection)",
+            constrained_test_rows_10,
+            top_k=args.sweep_top_k,
+        )
+        selected_rows = select_sweep_rows(
+            rows_val,
+            sweep_selection_baseline_overall,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        print_sweep_selections("Sweep Test Selection", selected_rows, rows_test)
 
 
     
