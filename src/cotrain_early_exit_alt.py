@@ -133,6 +133,46 @@ def _safe_float(x: float, fallback: float = 0.0) -> float:
     return fallback if x != x else x
 
 
+@torch.no_grad()
+def collect_cascade_margins(
+    model,
+    loader,
+    device,
+    *,
+    exit_heads,
+    payload_exit_cfg,
+    use_prob_margin: bool,
+):
+    model.eval()
+    for h in exit_heads:
+        h.eval()
+
+    margins_per_exit = [[] for _ in range(len(exit_heads))]
+    for xb, _ in loader:
+        xb = xb.to(device)
+        _, h_list = model.forward_with_all_hidden(xb)
+        for exit_id, cfg in enumerate(payload_exit_cfg):
+            layer_idx = int(cfg["layer_idx"])
+            logits = _head_logits_from_hidden(exit_heads[exit_id], h_list[layer_idx], device)
+            margin = _margin_from_logits(logits, use_prob=use_prob_margin)
+            margins_per_exit[exit_id].append(margin.detach().cpu())
+
+    return [
+        torch.cat(parts, dim=0) if parts else torch.empty(0)
+        for parts in margins_per_exit
+    ]
+
+
+def _unique_quantile_values(values: torch.Tensor, quantiles: List[float]) -> List[float]:
+    if values.numel() == 0:
+        return [0.0]
+    out = []
+    for q in quantiles:
+        out.append(float(torch.quantile(values, q).item()))
+    uniq = sorted(set(out))
+    return uniq if uniq else [0.0]
+
+
 def compute_exit_loss_by_layer(
     *,
     layer_idx: int,
@@ -780,6 +820,20 @@ def sweep_threshold_grid(
             use_prob_margin=use_prob_margin,
             log_margins=False,
         )
+        exit0_rate_val = float(out_val["exit_rates"][0]) if len(out_val["exit_rates"]) > 0 else 0.0
+        exit1_rate_val = float(out_val["exit_rates"][1]) if len(out_val["exit_rates"]) > 1 else 0.0
+        final_rate_val = float(out_val["final_rate"])
+        exp_layers_val = exit0_rate_val * 1.0 + exit1_rate_val * 2.0 + final_rate_val * 2.0
+
+        exit0_rate_test = float(out_test["exit_rates"][0]) if len(out_test["exit_rates"]) > 0 else 0.0
+        exit1_rate_test = float(out_test["exit_rates"][1]) if len(out_test["exit_rates"]) > 1 else 0.0
+        final_rate_test = float(out_test["final_rate"])
+        exp_layers_test = exit0_rate_test * 1.0 + exit1_rate_test * 2.0 + final_rate_test * 2.0
+
+        out_val = dict(out_val)
+        out_test = dict(out_test)
+        out_val["exp_layers"] = exp_layers_val
+        out_test["exp_layers"] = exp_layers_test
         rows_val.append({"thrs": thrs, **{
             "overall_acc": float(out_val["overall_acc"]),
             "exit_rates": list(out_val["exit_rates"]),
@@ -799,6 +853,44 @@ def sweep_threshold_grid(
     rows_val.sort(key=lambda row: row["overall_acc"], reverse=True)
     rows_test.sort(key=lambda row: row["overall_acc"], reverse=True)
     return rows_val, rows_test
+
+
+def sweep_cascade_by_quantile(
+    model,
+    val_loader,
+    test_loader,
+    device,
+    *,
+    exit_heads,
+    payload_exit_cfg,
+    quantile_groups: List[List[float]],
+    use_prob_margin: bool,
+):
+    margins = collect_cascade_margins(
+        model,
+        val_loader,
+        device,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        use_prob_margin=use_prob_margin,
+    )
+    thr_groups = [
+        _unique_quantile_values(margin, quantiles)
+        for margin, quantiles in zip(margins, quantile_groups)
+    ]
+    print("[quantile-sweep] threshold groups:", thr_groups)
+    num_combinations = int(torch.tensor([len(g) for g in thr_groups], dtype=torch.long).prod().item()) if thr_groups else 0
+    rows_val, rows_test = sweep_threshold_grid(
+        model,
+        val_loader,
+        test_loader,
+        device,
+        exit_heads=exit_heads,
+        payload_exit_cfg=payload_exit_cfg,
+        threshold_groups=thr_groups,
+        use_prob_margin=use_prob_margin,
+    )
+    return rows_val, rows_test, thr_groups, num_combinations
 
 
 def cotrain_g3_multi_exit_staged(
@@ -1228,9 +1320,12 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--batch_size_cached", type=int, default=512)
     parser.add_argument("--use_norm", action="store_true", default=True)
+    parser.add_argument("--train_classifier", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--final_train_layers", type=str, default="1", help='0-based backbone block indices for F phase, e.g. "1" or "0,1"')
     parser.add_argument("--thr", type=str, default="1.0,1.5",
                     help="comma-separated thresholds per exit, e.g. 1.0,1.5")
     parser.add_argument("--cascade_thr_grid", type=str, default="")
+    parser.add_argument("--cascade_quantiles", type=str, default="0.0,0.25,0.5,0.75,0.9,0.95")
     parser.add_argument("--sweep_selection_baseline_overall", type=float, default=94.71,
                         help="Baseline overall accuracy in percent for sweep selection constraints")
     parser.add_argument("--min_final_rate", type=float, default=0.45)
@@ -1238,7 +1333,7 @@ if __name__ == "__main__":
         "--max_exit_rates",
         type=str,
         default="0.10,0.50",
-        help="comma-separated max exit rates for each exit head"
+        help="comma-separated upper bounds on exit rates for each exit head, e.g. 0.25,0.45 means exit0<=25%, exit1<=45%"
     )
     parser.add_argument(
         "--min_exit_accs_select",
@@ -1250,8 +1345,9 @@ if __name__ == "__main__":
         "--min_exit_rates_select",
         type=str,
         default="0.0,0.0",
-        help="optional comma-separated min exit rates; useful to avoid degenerate exits"
+        help="optional comma-separated lower bounds on exit rates; usually keep at 0 unless you explicitly want to avoid degenerate near-zero exits"
     )
+    parser.add_argument("--train_exit_ids", type=str, default="", help='exit ids following backbone layer naming, e.g. "0,1"; empty means all exits')
     parser.add_argument("--sweep_top_k", type=int, default=20)
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1326,13 +1422,18 @@ if __name__ == "__main__":
         lr_exits_H=3e-5,
     )'''
 
+    final_train_layers = [int(x.strip()) for x in args.final_train_layers.split(",") if x.strip()]
+    if args.train_exit_ids.strip():
+        train_exit_ids = tuple(int(x.strip()) for x in args.train_exit_ids.split(",") if x.strip())
+    else:
+        train_exit_ids = tuple(range(len(exit_heads)))
     alt_cfg = AlternatingPhaseConfig(
         cycles=3,
         epochs_F=0,
         epochs_H=1,
-        final_train_layers=[1],
-        final_train_classifier=False,
-        train_exit_ids=(1, ),
+        final_train_layers=final_train_layers,
+        final_train_classifier=bool(args.train_classifier),
+        train_exit_ids=train_exit_ids,
         lr_backbone_F=1e-7,
         lr_classifier_F=0.0, #1e-5,
         lr_exits_H=3e-5,
@@ -1349,6 +1450,7 @@ if __name__ == "__main__":
     thrs_eval_list = [tuple(thrs_train)]
     thrs_tail_anchor = tuple(thrs_train)
     cascade_thr_grid = _parse_threshold_groups(args.cascade_thr_grid, len(exit_heads), "cascade_thr_grid")
+    cascade_quantile_groups = _parse_threshold_groups(args.cascade_quantiles, len(exit_heads), "cascade_quantiles")
     sweep_selection_baseline_overall = float(args.sweep_selection_baseline_overall) / 100.0
     max_exit_rates = parse_float_list(args.max_exit_rates, len(exit_heads), "max_exit_rates")
     if args.min_exit_accs_select is not None:
@@ -1505,6 +1607,78 @@ if __name__ == "__main__":
             min_exit_accs=min_exit_accs_select,
         )
         print_sweep_selections("Sweep Test Selection", selected_rows, rows_test)
+
+    if cascade_quantile_groups:
+        rows_val, rows_test, thr_groups, num_combinations = sweep_cascade_by_quantile(
+            backbone,
+            val_loader,
+            test_loader,
+            device,
+            exit_heads=exit_heads,
+            payload_exit_cfg=model_cfg.payload_exit_cfg,
+            quantile_groups=cascade_quantile_groups,
+            use_prob_margin=use_prob_margin,
+        )
+        print(f"[quantile-sweep] num_combinations={num_combinations}")
+        print_cascade_sweep_table("VAL cascade quantile sweep", rows_val, top_k=args.sweep_top_k)
+        print_cascade_sweep_table("TEST cascade quantile sweep", rows_test, top_k=args.sweep_top_k)
+        constrained_rows_05, cutoff_05 = get_constrained_rows(
+            rows_val,
+            baseline_overall=sweep_selection_baseline_overall,
+            drop_pp=0.5,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        constrained_rows_10, cutoff_10 = get_constrained_rows(
+            rows_val,
+            baseline_overall=sweep_selection_baseline_overall,
+            drop_pp=1.0,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        print_cascade_sweep_table(
+            f"VAL constrained efficiency top-k @ overall >= {cutoff_05 * 100:.2f}% (quantile)",
+            constrained_rows_05,
+            top_k=args.sweep_top_k,
+        )
+        print_cascade_sweep_table(
+            f"VAL constrained efficiency top-k @ overall >= {cutoff_10 * 100:.2f}% (quantile)",
+            constrained_rows_10,
+            top_k=args.sweep_top_k,
+        )
+        constrained_test_rows_05 = []
+        for row in constrained_rows_05:
+            matched = find_row_by_thrs(rows_test, row["thrs"])
+            if matched is not None:
+                constrained_test_rows_05.append(matched)
+        constrained_test_rows_10 = []
+        for row in constrained_rows_10:
+            matched = find_row_by_thrs(rows_test, row["thrs"])
+            if matched is not None:
+                constrained_test_rows_10.append(matched)
+        print_cascade_sweep_table(
+            f"TEST constrained efficiency top-k @ overall >= {cutoff_05 * 100:.2f}% (quantile, by VAL selection)",
+            constrained_test_rows_05,
+            top_k=args.sweep_top_k,
+        )
+        print_cascade_sweep_table(
+            f"TEST constrained efficiency top-k @ overall >= {cutoff_10 * 100:.2f}% (quantile, by VAL selection)",
+            constrained_test_rows_10,
+            top_k=args.sweep_top_k,
+        )
+        selected_rows = select_sweep_rows(
+            rows_val,
+            sweep_selection_baseline_overall,
+            min_final_rate=args.min_final_rate,
+            max_exit_rates=max_exit_rates,
+            min_exit_rates=min_exit_rates_select,
+            min_exit_accs=min_exit_accs_select,
+        )
+        print_sweep_selections("Sweep Test Selection (Quantile)", selected_rows, rows_test)
 
 
     
