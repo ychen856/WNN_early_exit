@@ -254,13 +254,13 @@ def resolve_exit_loss_setup(exit_layers):
         8: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
     }'''
 
-    '''# CE+KD+final
+    # CE+KD+final
     exit_loss_by_layer = {
         2: {"mode": "kd_final_correct", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         4: {"mode": "kd_final_correct", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         6: {"mode": "kd_final_correct", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         8: {"mode": "kd_final_correct", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
-    }'''
+    }
 
     '''# CE+KD+margin
     exit_loss_by_layer = {
@@ -271,12 +271,12 @@ def resolve_exit_loss_setup(exit_layers):
     }'''
 
     # KD layer-dependent
-    exit_loss_by_layer = {
+    '''exit_loss_by_layer = {
         2: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         4: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         6: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
         8: {"mode": "baseline", "override": {}},
-    }
+    }'''
 
     
 
