@@ -5,9 +5,11 @@ import math
 import os
 from pathlib import Path
 import json
+from typing import List, Tuple
 from networkx import sigma
 from torch.utils.data import DataLoader, random_split
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from src.core.linearExitHead import ExitHead
 from src.dataio.data import build_loaders_bits
@@ -58,6 +60,107 @@ def get_lr(epoch):
 def compute_accuracy(logits, y):
     preds = logits.argmax(dim=1)
     return (preds == y).float().mean().item()
+
+
+def margin_from_logits(logits):
+    top2 = logits.topk(2, dim=-1).values
+    return top2[:, 0] - top2[:, 1]
+
+
+def exit1_optimization_loss(
+    final_logits,
+    exit1_logits,
+    yb,
+    *,
+    use_kd=True,
+    kd_only_on_final_correct=False,
+    use_margin=True,
+    use_quota=False,
+    kd_T=2.0,
+    lambda_kd=0.3,
+    lambda_margin_pos=0.05,
+    lambda_margin_neg=0.10,
+    lambda_quota=0.02,
+    target_margin_correct=6.0,
+    target_margin_wrong=2.0,
+    target_exit_rate=0.20,
+    quota_thr=6.0,
+    quota_temp=1.25,
+):
+    loss_ce = F.cross_entropy(exit1_logits, yb)
+
+    loss = loss_ce
+    logs = {"loss_ce": float(loss_ce.detach())}
+
+    if use_kd:
+        with torch.no_grad():
+            teacher_prob = F.softmax(final_logits / kd_T, dim=-1)
+            final_pred = final_logits.argmax(dim=-1)
+            final_correct = (final_pred == yb)
+
+        student_log_prob = F.log_softmax(exit1_logits / kd_T, dim=-1)
+
+        if kd_only_on_final_correct:
+            if final_correct.any():
+                loss_kd = F.kl_div(
+                    student_log_prob[final_correct],
+                    teacher_prob[final_correct],
+                    reduction="batchmean"
+                ) * (kd_T * kd_T)
+            else:
+                loss_kd = exit1_logits.new_zeros(())
+        else:
+            loss_kd = F.kl_div(
+                student_log_prob,
+                teacher_prob,
+                reduction="batchmean"
+            ) * (kd_T * kd_T)
+
+        loss = loss + lambda_kd * loss_kd
+        logs["loss_kd"] = float(loss_kd.detach())
+        logs["final_correct_rate"] = float(final_correct.float().mean().detach())
+
+    margin = margin_from_logits(exit1_logits)
+    pred = exit1_logits.argmax(dim=-1)
+    correct = (pred == yb)
+
+    if use_margin:
+        if correct.any():
+            loss_margin_pos = F.relu(
+                target_margin_correct - margin[correct]
+            ).mean()
+        else:
+            loss_margin_pos = exit1_logits.new_zeros(())
+
+        if (~correct).any():
+            loss_margin_neg = F.relu(
+                margin[~correct] - target_margin_wrong
+            ).mean()
+        else:
+            loss_margin_neg = exit1_logits.new_zeros(())
+
+        loss = (
+            loss
+            + lambda_margin_pos * loss_margin_pos
+            + lambda_margin_neg * loss_margin_neg
+        )
+
+        logs["loss_margin_pos"] = float(loss_margin_pos.detach())
+        logs["loss_margin_neg"] = float(loss_margin_neg.detach())
+
+    if use_quota:
+        take_prob = torch.sigmoid((margin - quota_thr) / quota_temp)
+        soft_exit_rate = take_prob.mean()
+        loss_quota = (soft_exit_rate - target_exit_rate) ** 2
+
+        loss = loss + lambda_quota * loss_quota
+
+        logs["loss_quota"] = float(loss_quota.detach())
+        logs["soft_exit_rate"] = float(soft_exit_rate.detach())
+
+    logs["loss_total"] = float(loss.detach())
+    logs["exit1_acc"] = float(correct.float().mean().detach())
+    return loss, logs
 
 # -----------------------------
 # 2) Train exit head on cached features
@@ -154,8 +257,10 @@ def train_exit_head_on_cached(
     return clf
 
 def train_exit_head(model, train_loader, val_loader, device,
-                    num_epochs=50, base_lr=1e-3, weight_decay=1e-4):
+                    num_epochs=50, base_lr=1e-3, weight_decay=1e-4,
+                    use_advanced_loss=False, loss_cfg=None):
     model.to(device)
+    loss_cfg = loss_cfg or {}
 
     # freeze backbone + final classifier
     for p in model.layers.parameters():
@@ -183,8 +288,16 @@ def train_exit_head(model, train_loader, val_loader, device,
             yb = yb.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            _, exit1_logits, _ = model.forward_with_all_hidden_and_exits(xb)
-            loss = F.cross_entropy(exit1_logits, yb)
+            final_logits, exit1_logits, _ = model.forward_with_all_hidden_and_exits(xb)
+            if use_advanced_loss:
+                loss, _ = exit1_optimization_loss(
+                    final_logits,
+                    exit1_logits,
+                    yb,
+                    **loss_cfg,
+                )
+            else:
+                loss = F.cross_entropy(exit1_logits, yb)
             loss.backward()
             optimizer.step()
 
@@ -284,23 +397,225 @@ def _broadcast(xs, n):
         return xs
     raise ValueError(f"Need 1 or {n} values, got {len(xs)}")
 
+
+def build_exit_loss_cfg(
+    loss_mode,
+    *,
+    kd_T=2.0,
+    lambda_kd=0.3,
+    lambda_margin_pos=0.05,
+    lambda_margin_neg=0.10,
+    lambda_quota=0.02,
+    target_margin_correct=6.0,
+    target_margin_wrong=2.0,
+    target_exit_rate=0.20,
+    quota_thr=6.0,
+    quota_temp=1.25,
+):
+    mode_cfg = {
+        "baseline": {
+            "use_advanced_loss": False,
+            "loss_cfg": {},
+        },
+        "kd": {
+            "use_advanced_loss": True,
+            "loss_cfg": {
+                "use_kd": True,
+                "kd_only_on_final_correct": False,
+                "use_margin": False,
+                "use_quota": False,
+            },
+        },
+        "kd_final_correct": {
+            "use_advanced_loss": True,
+            "loss_cfg": {
+                "use_kd": True,
+                "kd_only_on_final_correct": True,
+                "use_margin": False,
+                "use_quota": False,
+            },
+        },
+        "kd_margin": {
+            "use_advanced_loss": True,
+            "loss_cfg": {
+                "use_kd": True,
+                "kd_only_on_final_correct": False,
+                "use_margin": True,
+                "use_quota": False,
+            },
+        },
+        "kd_margin_quota": {
+            "use_advanced_loss": True,
+            "loss_cfg": {
+                "use_kd": True,
+                "kd_only_on_final_correct": False,
+                "use_margin": True,
+                "use_quota": True,
+            },
+        },
+    }
+    if loss_mode not in mode_cfg:
+        raise ValueError(f"Unsupported exit_loss_mode={loss_mode}")
+
+    cfg = dict(mode_cfg[loss_mode])
+    loss_cfg = dict(cfg["loss_cfg"])
+    loss_cfg.update({
+        "kd_T": kd_T,
+        "lambda_kd": lambda_kd,
+        "lambda_margin_pos": lambda_margin_pos,
+        "lambda_margin_neg": lambda_margin_neg,
+        "lambda_quota": lambda_quota,
+        "target_margin_correct": target_margin_correct,
+        "target_margin_wrong": target_margin_wrong,
+        "target_exit_rate": target_exit_rate,
+        "quota_thr": quota_thr,
+        "quota_temp": quota_temp,
+    })
+    cfg["loss_cfg"] = loss_cfg
+    return cfg
+
+
+def resolve_exit_loss_setup(exit_layers):
+    """
+    Fixed per-exit loss setup.
+    Key by layer_idx so each exit head can keep its own recipe while the
+    training loop still runs one head at a time.
+    """
+    exit_loss_defaults = {
+        "kd_T": 2.0,
+        "lambda_kd": 0.3,
+        "lambda_margin_pos": 0.05,
+        "lambda_margin_neg": 0.10,
+        "lambda_quota": 0.02,
+        "target_margin_correct": 6.0,
+        "target_margin_wrong": 2.0,
+        "target_exit_rate": 0.20,
+        "quota_thr": 6.0,
+        "quota_temp": 1.25,
+    }
+
+    # Example:
+    # exit_loss_by_layer = {
+    #     0: {"mode": "baseline"},
+    #     1: {"mode": "kd_margin_quota", "override": {"target_exit_rate": 0.15}},
+    # }
+    '''exit_loss_by_layer = {
+        layer_idx: {"mode": "baseline", "override": {}}
+        for layer_idx in exit_layers
+    }'''
+    exit_loss_by_layer = {
+        0: {"mode": "baseline"},
+        #1: {'mode': 'kd', 'override': {
+        #    "kd_T": 4.0,
+        #    "lambda_kd": 0.7,
+        #}},
+        #1: {'mode': 'kd_final_correct', 'override': {
+        #    'kd_T': 2.0,
+        #    'lambda_kd': 0.7,
+        #}},
+        #1: {'mode': 'kd_margin', 'override': {
+        #    'kd_T': 2.0,
+        #    'lambda_kd': 0.5,
+        #    'lambda_margin_pos': 0.1,
+        #    'lambda_margin_neg': 0.2,
+        #}},
+    }
+
+    # CE + KD ***
+    '''exit_loss_by_layer = {
+        0: {'mode': 'kd', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+        1: {'mode': 'kd', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+    }'''
+
+    # CE + KD + final
+    '''exit_loss_by_layer = {
+        0: {'mode': 'kd_final_correct', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+        1: {'mode': 'kd_final_correct', 'override': {
+            "kd_T": 2.0,
+            "lambda_kd": 0.7,
+        }},
+    }'''
+
+    # CE + KD + margin
+    exit_loss_by_layer = {
+        0: {'mode': 'kd_margin', 'override': {
+            'kd_T': 2.0,
+            'lambda_kd': 0.5,
+            'lambda_margin_pos': 0.1,
+            'lambda_margin_neg': 0.2,
+        }},
+        1: {'mode': 'kd_margin', 'override': {
+            'kd_T': 2.0,
+            'lambda_kd': 0.5,
+            'lambda_margin_pos': 0.1,
+            'lambda_margin_neg': 0.2,
+        }},
+    }
+
+    resolved = []
+    for layer_idx in exit_layers:
+        spec = exit_loss_by_layer.get(layer_idx, {"mode": "baseline", "override": {}})
+        loss_mode = spec.get("mode", "baseline")
+        override = spec.get("override", {})
+        head_loss_cfg = build_exit_loss_cfg(
+            loss_mode,
+            **{**exit_loss_defaults, **override},
+        )
+        resolved.append((loss_mode, override, head_loss_cfg))
+
+    return resolved
+
 @torch.no_grad()
-def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, use_norm: bool):
+def cache_exit_features(model, loader, device, layer_idx, keep_idx, mu, sigma, use_norm: bool, return_final_logits: bool = False):
     model.eval()
     Xs, ys = [], []
+    final_logits_list = []
     for xb, yb in loader:
         xb = xb.to(device)
-        _, h_list = model.forward_with_all_hidden(xb)
+        final_logits, h_list = model.forward_with_all_hidden(xb)
         h = h_list[layer_idx][:, keep_idx]
         if use_norm:
             h = (h - mu.to(h.device)) / sigma.to(h.device)
         Xs.append(h.detach().cpu())
         ys.append(yb.detach().cpu())
-    return torch.cat(Xs, 0), torch.cat(ys, 0)
+        if return_final_logits:
+            final_logits_list.append(final_logits.detach().cpu())
 
-def train_one_exit_cached(head, X_train, y_train, X_val, y_val, device, epochs=50, lr=3e-3, wd=1e-3, bs=512):
+    X = torch.cat(Xs, 0)
+    y = torch.cat(ys, 0)
+    if return_final_logits:
+        return X, y, torch.cat(final_logits_list, 0)
+    return X, y
+
+
+def train_one_exit_cached(
+    head,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    device,
+    epochs=50,
+    lr=3e-3,
+    wd=1e-3,
+    bs=512,
+    final_logits_train=None,
+    final_logits_val=None,
+    use_advanced_loss=False,
+    loss_cfg=None,
+):
     head.to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=wd)
+    loss_cfg = loss_cfg or {}
 
     best = None
     best_val = 0.0
@@ -312,6 +627,7 @@ def train_one_exit_cached(head, X_train, y_train, X_val, y_val, device, epochs=5
         tot_loss = 0.0
         corr = 0
         tot = 0
+        metric_sums = {}
 
         for i in range(0, N, bs):
             idx = perm[i:i+bs]
@@ -320,21 +636,68 @@ def train_one_exit_cached(head, X_train, y_train, X_val, y_val, device, epochs=5
 
             opt.zero_grad()
             logits = head.classifier(xb) / head.exit_tau  # cached 已經是 [N,k]
-            loss = F.cross_entropy(logits, yb)
+
+            if use_advanced_loss:
+                if final_logits_train is None:
+                    raise ValueError("final_logits_train is required when use_advanced_loss=True")
+                teacher_logits = final_logits_train[idx].to(device)
+                loss, loss_logs = exit1_optimization_loss(
+                    teacher_logits,
+                    logits,
+                    yb,
+                    **loss_cfg,
+                )
+            else:
+                loss = F.cross_entropy(logits, yb)
+                loss_logs = {
+                    "loss_total": float(loss.detach()),
+                    "loss_ce": float(loss.detach()),
+                    "exit1_acc": float((logits.argmax(-1) == yb).float().mean().detach()),
+                }
+
             loss.backward()
             opt.step()
 
             tot_loss += loss.item() * yb.size(0)
             corr += (logits.argmax(-1) == yb).sum().item()
             tot += yb.size(0)
+            for k, v in loss_logs.items():
+                metric_sums[k] = metric_sums.get(k, 0.0) + v * yb.size(0)
 
         head.eval()
         with torch.no_grad():
             v_logits = head.classifier(X_val.to(device)) / head.exit_tau
             v_acc = (v_logits.argmax(-1).cpu() == y_val).float().mean().item()
-            v_loss = F.cross_entropy(v_logits, y_val.to(device)).item()
+            if use_advanced_loss:
+                if final_logits_val is None:
+                    raise ValueError("final_logits_val is required when use_advanced_loss=True")
+                v_loss, v_logs = exit1_optimization_loss(
+                    final_logits_val.to(device),
+                    v_logits,
+                    y_val.to(device),
+                    **loss_cfg,
+                )
+                v_loss = float(v_loss.detach())
+            else:
+                v_loss = F.cross_entropy(v_logits, y_val.to(device)).item()
+                v_logs = {
+                    "loss_total": v_loss,
+                    "loss_ce": v_loss,
+                    "exit1_acc": v_acc,
+                }
+
+        train_logs = {k: v / tot for k, v in metric_sums.items()}
+        train_ce = train_logs.get("loss_ce", tot_loss / tot)
+        train_kd = train_logs.get("loss_kd", 0.0)
+        train_margin_pos = train_logs.get("loss_margin_pos", 0.0)
+        train_margin_neg = train_logs.get("loss_margin_neg", 0.0)
+        train_quota = train_logs.get("loss_quota", 0.0)
+        train_exit_rate = train_logs.get("soft_exit_rate", float("nan"))
 
         print(f"[exit layer] ep{ep:03d} train_loss={tot_loss/tot:.4f} train_acc={corr/tot*100:.2f}% "
+              f"| train_ce={train_ce:.4f} train_kd={train_kd:.4f} "
+              f"| train_margin+={train_margin_pos:.4f} train_margin-={train_margin_neg:.4f} "
+              f"| train_quota={train_quota:.4f} train_soft_exit_rate={train_exit_rate:.4f} "
               f"| val_loss={v_loss:.4f} val_acc={v_acc*100:.2f}%")
 
         if v_acc > best_val:
@@ -412,13 +775,18 @@ if __name__ == "__main__":
     keep_modes = _broadcast([x.strip() for x in args.keep_mode.split(",")], len(exit_layers))
     exit_taus = _broadcast([float(x.strip()) for x in args.exit_tau.split(",")], len(exit_layers))
     thrs = _broadcast([float(x.strip()) for x in args.thr.split(",")], len(exit_layers))
+    exit_loss_specs = resolve_exit_loss_setup(exit_layers)
 
     exit_heads = []
     exit_cfg_list = []
 
-    for layer_idx, k, kmode, exit_tau, thr in zip(exit_layers, ks, keep_modes, exit_taus, thrs):
+    for layer_idx, k, kmode, exit_tau, thr, loss_spec in zip(
+        exit_layers, ks, keep_modes, exit_taus, thrs, exit_loss_specs
+    ):
+        exit_loss_mode, exit_loss_override, head_loss_cfg = loss_spec
         print("\n" + "="*80)
         print(f"Build/Train exit @ layer {layer_idx} | k={k} mode={kmode} exit_tau={exit_tau} thr={thr}")
+        print(f"Loss mode: {exit_loss_mode} | loss_override={exit_loss_override}")
         print("="*80)
 
         mean_d, std_d, p1_d, bias = analyze_hidden_for_exit(model, train_loader, device, layer_idx=layer_idx)
@@ -427,10 +795,17 @@ if __name__ == "__main__":
         mu, sigma = compute_mu_sigma(model, train_loader, device, layer_idx=layer_idx, exit_keep_idx=exit_keep_idx)
 
         # cache (optional normalization)
-        X_train, y_train = cache_exit_features(model, train_loader, device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
-        X_val, y_val     = cache_exit_features(model, val_loader,   device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
-        X_test, y_test   = cache_exit_features(model, test_loader,  device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm)
+        X_train, y_train, final_logits_train = cache_exit_features(
+            model, train_loader, device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm, return_final_logits=True
+        )
+        X_val, y_val, final_logits_val = cache_exit_features(
+            model, val_loader, device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm, return_final_logits=True
+        )
+        X_test, y_test = cache_exit_features(
+            model, test_loader, device, layer_idx, exit_keep_idx, mu, sigma, args.use_norm
+        )
         print(f"[cache] train {tuple(X_train.shape)} val {tuple(X_val.shape)} test {tuple(X_test.shape)}")
+        print(f"[loss] mode={exit_loss_mode} advanced={head_loss_cfg['use_advanced_loss']}")
 
         # head from scratch (but classifier trained on cached X)
         head = ExitHead(k=k, num_classes=C, exit_tau=exit_tau,
@@ -440,7 +815,15 @@ if __name__ == "__main__":
         # 只訓練 classifier.weight（因為 keep_idx/mu/sigma 是 buffer）
         head, best_val = train_one_exit_cached(
             head, X_train, y_train, X_val, y_val,
-            device, epochs=args.epochs, lr=args.lr, wd=args.weight_decay, bs=args.batch_size_cached
+            device,
+            epochs=args.epochs,
+            lr=args.lr,
+            wd=args.weight_decay,
+            bs=args.batch_size_cached,
+            final_logits_train=final_logits_train,
+            final_logits_val=final_logits_val,
+            use_advanced_loss=head_loss_cfg["use_advanced_loss"],
+            loss_cfg=head_loss_cfg["loss_cfg"],
         )
 
         # 存 cfg（list item）
@@ -546,5 +929,3 @@ if __name__ == "__main__":
         exit_cfg_list=payload_exit_cfg
     )
     
-
-
