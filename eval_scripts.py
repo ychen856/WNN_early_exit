@@ -52,7 +52,8 @@ def eval_epoch_quweit(model, loader, device):
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
-        logits = model(xb)["logits"]
+        out = model(xb)
+        logits = out["logits"] if isinstance(out, dict) else out
         loss = F.cross_entropy(logits, yb)
         total_loss += float(loss.item()) * yb.size(0)
         total_correct += int((logits.argmax(dim=-1) == yb).sum().item())
