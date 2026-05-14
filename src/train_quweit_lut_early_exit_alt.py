@@ -409,12 +409,7 @@ def compute_selection_metric(
     record: Dict[str, Any],
     best_metric: str,
     combo_metric_weights: Tuple[float, float, float] = (0.5, 0.3, 0.2),
-    min_exit_accs: Optional[Sequence[Optional[float]]] = None,
     min_tail_count: int = 0,
-    baseline_overall: Optional[float] = None,
-    baseline_tail_acc: Optional[float] = None,
-    max_overall_drop: float = 0.005,
-    max_tail_drop: float = 0.01,
 ) -> float:
     overall = float(record["overall_acc"])
     final_only = _safe_float(record["final_acc"], fallback=-1.0)
@@ -434,19 +429,6 @@ def compute_selection_metric(
         raise ValueError("best_metric must be one of ['val_overall_acc', 'val_final_only', 'val_final_tail_only', 'val_combo']")
 
     if best_metric == "val_final_tail_only" and int(record["tail_count"]) < int(min_tail_count):
-        return -1.0
-    if min_exit_accs is not None and record.get("exit_accs") is not None:
-        exit_accs = record["exit_accs"]
-        for i, min_acc in enumerate(min_exit_accs):
-            if min_acc is None:
-                continue
-            if i >= len(exit_accs):
-                continue
-            if exit_accs[i] < min_acc:
-                return -1.0
-    if baseline_overall is not None and overall < float(baseline_overall) - float(max_overall_drop):
-        return -1.0
-    if baseline_tail_acc is not None and final_tail < float(baseline_tail_acc) - float(max_tail_drop):
         return -1.0
     return metric
 
@@ -756,9 +738,6 @@ def cotrain_quweit_alternating(
     best_metric: str = "val_combo",
     best_eval_idx: int = 0,
     combo_metric_weights: Tuple[float, float, float] = (0.5, 0.3, 0.2),
-    min_exit_accs: Optional[Sequence[Optional[float]]] = None,
-    max_overall_drop: float = 0.005,
-    max_tail_drop: float = 0.01,
     weight_decay: float = 1e-4,
     grad_clip: float = 1.0,
     use_prob_margin: bool = False,
@@ -782,11 +761,6 @@ def cotrain_quweit_alternating(
         initial_selected,
         best_metric=best_metric,
         combo_metric_weights=combo_metric_weights,
-        min_exit_accs=min_exit_accs,
-        baseline_overall=baseline_overall,
-        baseline_tail_acc=baseline_tail_acc,
-        max_overall_drop=max_overall_drop,
-        max_tail_drop=max_tail_drop,
     )
     best = {
         "metric": initial_metric,
@@ -930,11 +904,6 @@ def cotrain_quweit_alternating(
             selected,
             best_metric=best_metric,
             combo_metric_weights=combo_metric_weights,
-            min_exit_accs=min_exit_accs,
-            baseline_overall=baseline_overall,
-            baseline_tail_acc=baseline_tail_acc,
-            max_overall_drop=max_overall_drop,
-            max_tail_drop=max_tail_drop,
         )
 
         print(
@@ -992,9 +961,6 @@ def main():
     parser.add_argument("--use_prob_margin", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best_metric", type=str, default="val_combo")
     parser.add_argument("--combo_metric_weights", type=str, default="0.5,0.3,0.2")
-    parser.add_argument("--max_overall_drop", type=float, default=0.005)
-    parser.add_argument("--max_tail_drop", type=float, default=0.01)
-    parser.add_argument("--min_exit_accs", type=str, default="0.98,0.98")
     parser.add_argument("--sweep_selection_baseline_overall", type=float, default=94.71,
                         help="Baseline overall accuracy in percent for sweep top-k selection")
     parser.add_argument("--single_thr_list", type=str, default="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,5.0,6.0")
@@ -1069,9 +1035,6 @@ def main():
     combo_metric_weights = tuple(_parse_csv(args.combo_metric_weights, float))
     if len(combo_metric_weights) != 3:
         raise ValueError("--combo_metric_weights must have exactly 3 values")
-
-    min_exit_accs_raw = _broadcast(_parse_csv(args.min_exit_accs, float), len(exit_heads), "min_exit_accs")
-    min_exit_accs = tuple(float(x) for x in min_exit_accs_raw)
     '''exit_loss_by_layer = {
         int(cfg["layer_idx"]) - 1: {"mode": "kd_final_correct", "override": {"kd_T": 2.0, "lambda_kd": 0.7}}
         for cfg in payload_exit_cfg
@@ -1166,9 +1129,6 @@ def main():
         best_metric=args.best_metric,
         best_eval_idx=0,
         combo_metric_weights=combo_metric_weights,
-        min_exit_accs=min_exit_accs,
-        max_overall_drop=args.max_overall_drop,
-        max_tail_drop=args.max_tail_drop,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         use_prob_margin=args.use_prob_margin,
