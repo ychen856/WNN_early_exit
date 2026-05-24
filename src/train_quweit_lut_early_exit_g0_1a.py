@@ -242,10 +242,13 @@ def resolve_exit_loss_setup(exit_layers):
     #     1: {"mode": "baseline"},
     #     2: {"mode": "kd_margin_quota", "override": {"target_exit_rate": 0.15}},
     # }
-    #exit_loss_by_layer = {
-    #    layer_idx: {"mode": "baseline", "override": {}}
-    #    for layer_idx in exit_layers
-    #}
+    
+    # baseline for all
+    exit_loss_by_layer = {
+        layer_idx: {"mode": "baseline", "override": {}}
+        for layer_idx in exit_layers
+    }
+
     # CE+KD
     '''exit_loss_by_layer = {
         2: {"mode": "kd", "override": {'kd_T': 2.0, "lambda_kd": 0.7}},
@@ -263,12 +266,12 @@ def resolve_exit_loss_setup(exit_layers):
     }'''
 
     # CE+KD+margin
-    exit_loss_by_layer = {
+    '''exit_loss_by_layer = {
         2: {"mode": "kd_margin", "override": {'kd_T': 2.0, "lambda_kd": 0.7, "lambda_margin_pos": 0.1, "lambda_margin_neg": 0.2}},
         4: {"mode": "kd_margin", "override": {'kd_T': 2.0, "lambda_kd": 0.7, "lambda_margin_pos": 0.1, "lambda_margin_neg": 0.2}},
         6: {"mode": "kd_margin", "override": {'kd_T': 2.0, "lambda_kd": 0.7, "lambda_margin_pos": 0.1, "lambda_margin_neg": 0.2}},
         8: {"mode": "kd_margin", "override": {'kd_T': 2.0, "lambda_kd": 0.7, "lambda_margin_pos": 0.1, "lambda_margin_neg": 0.2}},
-    }
+    }'''
 
     # KD layer-dependent
     '''exit_loss_by_layer = {
