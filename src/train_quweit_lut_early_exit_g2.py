@@ -13,7 +13,7 @@ from src.core.multiLayerWNN import save_ckpt_v2
 from src.early_exit import _head_logits_from_hidden_trainable, _margin_from_logits
 from src.exit.ckpt_exit import ExitConfig
 from src.train_quweit_lut_backbone_v2 import QuWeiTViT, TrainConfig
-from src.train_quweit_lut_early_exit_g0 import build_clean_cifar_loaders, get_external_exit_profile
+from src.train_quweit_lut_early_exit_g0_ce import build_clean_cifar_loaders, get_external_exit_profile
 
 
 def _parse_csv(s: str, cast=float) -> List:
