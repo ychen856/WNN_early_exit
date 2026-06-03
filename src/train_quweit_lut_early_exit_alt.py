@@ -970,7 +970,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(args.seed)
+    #torch.manual_seed(args.seed)
 
     backbone, backbone_cfg, raw_backbone_ckpt = load_quweit_backbone_ckpt(
         args.backbone_ckpt,

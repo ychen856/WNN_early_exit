@@ -1261,7 +1261,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(args.seed)
+    #torch.manual_seed(args.seed)
     probe_batch_size = args.batch_size_train if args.batch_size_train is not None else args.batch_size_probe
 
     model, backbone_cfg, raw_ckpt = load_quweit_backbone_ckpt(args.backbone_ckpt, device, use_ema=args.use_ema_backbone)
