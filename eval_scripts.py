@@ -9,6 +9,7 @@ from src.core.multiLayerWNN import build_backbone_from_ckpt
 from src.dataio.data import build_loaders_bits
 from src.early_exit import (
     collect_exit_margins,
+    eval_backbone_profile,
     eval_cascade_multi_exit,
     eval_overall_at_thr_multi_exit,
     make_thr_candidates_from_quantiles,
@@ -102,8 +103,11 @@ def get_efficiency_rows(rows: List[dict], baseline_overall: float, drop_pp: floa
     return sort_rows_for_efficiency(filtered), cutoff
 
 
-def print_backbone_eval(name: str, loss: float, acc: float):
-    print(f"[{name}] loss={loss:.4f} acc={acc * 100:.2f}%")
+def print_backbone_eval(name: str, loss: float, acc: float, avg_flops: float, avg_macs: float):
+    print(
+        f"[{name}] loss={loss:.4f} acc={acc * 100:.2f}% "
+        f"avgFLOPs={avg_flops:.0f} avgMACs={avg_macs:.0f}"
+    )
 
 
 def print_cascade_summary(name: str, out: dict, thrs: Sequence[float]):
@@ -384,8 +388,22 @@ def main():
 
     val_loss, val_acc = eval_epoch(backbone, val_loader, device)
     test_loss, test_acc = eval_epoch(backbone, test_loader, device)
-    print_backbone_eval("backbone:val", val_loss, val_acc)
-    print_backbone_eval("backbone:test", test_loss, test_acc)
+    val_profile = eval_backbone_profile(backbone, val_loader, device)
+    test_profile = eval_backbone_profile(backbone, test_loader, device)
+    print_backbone_eval(
+        "backbone:val",
+        val_loss,
+        val_acc,
+        float(val_profile["avg_flops_per_sample"]),
+        float(val_profile["avg_macs_per_sample"]),
+    )
+    print_backbone_eval(
+        "backbone:test",
+        test_loss,
+        test_acc,
+        float(test_profile["avg_flops_per_sample"]),
+        float(test_profile["avg_macs_per_sample"]),
+    )
     sweep_selection_baseline_overall_val = (
         float(args.sweep_selection_baseline_overall_val) / 100.0
         if args.sweep_selection_baseline_overall_val is not None
