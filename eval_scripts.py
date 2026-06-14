@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from src.core.linearExitHead import build_exits_from_ckpt
+from src.early_exit import eval_backbone_profile
 from src.train_quweit_lut_early_exit_g0_ce import (
     build_clean_cifar_loaders,
     collect_cascade_cache,
@@ -93,8 +94,11 @@ def find_row_by_thrs(rows: List[dict], thrs: Sequence[float], tol: float = 1e-6)
     return None
 
 
-def print_backbone_eval(name: str, loss: float, acc: float):
-    print(f"[{name}] loss={loss:.4f} acc={acc * 100:.2f}%")
+def print_backbone_eval(name: str, loss: float, acc: float, avg_flops: float, avg_macs: float):
+    print(
+        f"[{name}] loss={loss:.4f} acc={acc * 100:.2f}% "
+        f"avgFLOPs={avg_flops:.0f} avgMACs={avg_macs:.0f}"
+    )
 
 
 def print_cascade_summary(name: str, out: dict, thrs: Sequence[float]):
@@ -289,8 +293,22 @@ def main():
 
     val_loss, val_acc = eval_epoch_quweit(backbone, val_loader, device)
     test_loss, test_acc = eval_epoch_quweit(backbone, test_loader, device)
-    print_backbone_eval("backbone:val", val_loss, val_acc)
-    print_backbone_eval("backbone:test", test_loss, test_acc)
+    val_profile = eval_backbone_profile(backbone, val_loader, device)
+    test_profile = eval_backbone_profile(backbone, test_loader, device)
+    print_backbone_eval(
+        "backbone:val",
+        val_loss,
+        val_acc,
+        float(val_profile["avg_flops_per_sample"]),
+        float(val_profile["avg_macs_per_sample"]),
+    )
+    print_backbone_eval(
+        "backbone:test",
+        test_loss,
+        test_acc,
+        float(test_profile["avg_flops_per_sample"]),
+        float(test_profile["avg_macs_per_sample"]),
+    )
 
     baseline_val = float(args.sweep_selection_baseline_overall_val) / 100.0 if args.sweep_selection_baseline_overall_val is not None else float(val_acc)
     baseline_test = float(args.sweep_selection_baseline_overall_test) / 100.0 if args.sweep_selection_baseline_overall_test is not None else float(test_acc)
