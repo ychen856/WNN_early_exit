@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from src.core.linearExitHead import build_exits_from_ckpt
-from src.early_exit import eval_backbone_profile
 from src.train_quweit_lut_early_exit_g0_ce import (
     build_clean_cifar_loaders,
     collect_cascade_cache,
@@ -15,6 +14,7 @@ from src.train_quweit_lut_early_exit_g0_ce import (
     get_external_exit_profile,
     load_quweit_backbone_ckpt,
 )
+from src.train_quweit_lut_backbone_v2 import get_model_profile
 
 
 def parse_csv(s: str, cast=float) -> List:
@@ -60,6 +60,20 @@ def eval_epoch_quweit(model, loader, device):
         total_correct += int((logits.argmax(dim=-1) == yb).sum().item())
         total += int(yb.size(0))
     return total_loss / max(total, 1), total_correct / max(total, 1)
+
+
+def eval_backbone_profile_quweit(model) -> dict:
+    profile = get_model_profile(model)
+    return {
+        "avg_flops_per_sample": float(profile["backbone_full_flops"]),
+        "avg_macs_per_sample": float(profile["backbone_full_macs"]),
+        "avg_layers_executed_per_sample": float(profile["num_backbone_layers"]),
+        "backbone_params": float(profile["backbone_params"]),
+        "total_exit_head_params": 0.0,
+        "param_overhead_ratio": 0.0,
+        "compute_overhead_ratio": 1.0,
+        "compute_saving_ratio": 0.0,
+    }
 
 
 def load_quweit_exits(exit_ckpt: str, device, num_classes: int):
@@ -293,8 +307,8 @@ def main():
 
     val_loss, val_acc = eval_epoch_quweit(backbone, val_loader, device)
     test_loss, test_acc = eval_epoch_quweit(backbone, test_loader, device)
-    val_profile = eval_backbone_profile(backbone, val_loader, device)
-    test_profile = eval_backbone_profile(backbone, test_loader, device)
+    val_profile = eval_backbone_profile_quweit(backbone)
+    test_profile = eval_backbone_profile_quweit(backbone)
     print_backbone_eval(
         "backbone:val",
         val_loss,
