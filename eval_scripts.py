@@ -1,11 +1,13 @@
 import argparse
 import itertools
+from dataclasses import fields
 from typing import List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
 from src.core.linearExitHead import build_exits_from_ckpt
+from src.train_quweit_lut_backbone_v2 import QuWeiTViT, TrainConfig, get_model_profile
 from src.train_quweit_lut_early_exit_g0_ce import (
     build_clean_cifar_loaders,
     collect_cascade_cache,
@@ -14,7 +16,6 @@ from src.train_quweit_lut_early_exit_g0_ce import (
     get_external_exit_profile,
     load_quweit_backbone_ckpt,
 )
-from src.train_quweit_lut_backbone_v2 import get_model_profile
 
 
 def parse_csv(s: str, cast=float) -> List:
@@ -80,6 +81,32 @@ def load_quweit_exits(exit_ckpt: str, device, num_classes: int):
     exit_heads, exit_cfg_list = build_exits_from_ckpt(exit_ckpt, device, num_classes=num_classes)
     payload_exit_cfg = [cfg.to_payload() for cfg in exit_cfg_list]
     return exit_heads, payload_exit_cfg
+
+
+def _cfg_from_payload(cfg_payload: dict) -> TrainConfig:
+    allowed = {f.name for f in fields(TrainConfig)}
+    cfg_dict = {k: v for k, v in cfg_payload.items() if k in allowed}
+    cfg = TrainConfig(**cfg_dict)
+    cfg.use_exit = False
+    return cfg
+
+
+def load_quweit_cascade_bundle(exit_ckpt: str, device):
+    ckpt = torch.load(exit_ckpt, map_location=device)
+    if "model_state_dict" not in ckpt or "backbone_cfg" not in ckpt:
+        raise ValueError("Checkpoint does not contain a co-trained backbone bundle.")
+
+    backbone_cfg_payload = ckpt["backbone_cfg"]
+    cfg_payload = backbone_cfg_payload["config"] if isinstance(backbone_cfg_payload, dict) and "config" in backbone_cfg_payload else backbone_cfg_payload
+    cfg = _cfg_from_payload(cfg_payload)
+
+    model = QuWeiTViT(cfg).to(device)
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    print("[load_quweit_cascade_bundle] backbone missing:", missing)
+    print("[load_quweit_cascade_bundle] backbone unexpected:", unexpected)
+
+    exit_heads, payload_exit_cfg = load_quweit_exits(exit_ckpt, device, num_classes=cfg.num_classes)
+    return model.eval(), cfg, exit_heads, payload_exit_cfg
 
 
 def sort_rows_for_efficiency(rows: List[dict]) -> List[dict]:
@@ -284,9 +311,20 @@ def main():
     torch.manual_seed(args.seed)
 
     backbone, backbone_cfg, _ = load_quweit_backbone_ckpt(args.backbone_ckpt, device, use_ema=args.use_ema_backbone)
-    exit_heads, payload_exit_cfg = load_quweit_exits(args.exit_ckpt, device, num_classes=backbone_cfg.num_classes)
+    cascade_backbone = backbone
+    cascade_backbone_cfg = backbone_cfg
+    try:
+        cascade_backbone, cascade_backbone_cfg, exit_heads, payload_exit_cfg = load_quweit_cascade_bundle(args.exit_ckpt, device)
+        print("[info] cascade backbone source=exit_ckpt")
+    except ValueError:
+        exit_heads, payload_exit_cfg = load_quweit_exits(args.exit_ckpt, device, num_classes=backbone_cfg.num_classes)
+        print("[info] cascade backbone source=backbone_ckpt (exit_ckpt has no backbone weights)")
     if not exit_heads:
         raise ValueError("No exit heads found in --exit_ckpt")
+    if cascade_backbone_cfg.num_classes != backbone_cfg.num_classes:
+        raise ValueError(
+            f"Cascade/backbone num_classes mismatch: cascade={cascade_backbone_cfg.num_classes}, backbone={backbone_cfg.num_classes}"
+        )
 
     _, val_loader, test_loader, num_classes = build_clean_cifar_loaders(
         backbone_cfg,
@@ -335,9 +373,9 @@ def main():
         f"(cuts: {(baseline_test - 0.005) * 100:.2f}%, {(baseline_test - 0.010) * 100:.2f}%)"
     )
 
-    profile = get_external_exit_profile(backbone, exit_heads, payload_exit_cfg)
-    val_cache = collect_cascade_cache(backbone, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
-    test_cache = collect_cascade_cache(backbone, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
+    profile = get_external_exit_profile(cascade_backbone, exit_heads, payload_exit_cfg)
+    val_cache = collect_cascade_cache(cascade_backbone, val_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
+    test_cache = collect_cascade_cache(cascade_backbone, test_loader, device, exit_heads=exit_heads, exit_cfg_list=payload_exit_cfg)
 
     ckpt_thrs = [float(cfg["thr"]) for cfg in payload_exit_cfg if "thr" in cfg]
     if len(ckpt_thrs) == len(payload_exit_cfg):
