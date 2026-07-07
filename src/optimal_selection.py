@@ -10,7 +10,7 @@ import pandas as pd
 # =========================
 
 FMNIST_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - fmnist - constrain - v2.csv"
-CIFAR10_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - cifar - constrain- v2.csv"
+CIFAR10_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - cifar - constrain- v3.csv"
 EXPORT_DIR = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/optimal_selection"
 
 EPSILON = 1.0  # percentage point

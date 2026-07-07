@@ -12,7 +12,7 @@ import pandas as pd
 FMNIST_CONSTRAIN_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - fmnist - constrain - v2.csv"
 FMNIST_THR_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - fmnist - thr -v3.csv"
 
-CIFAR10_CONSTRAIN_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - cifar - constrain- v2.csv"
+CIFAR10_CONSTRAIN_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - cifar - constrain- v3.csv"
 CIFAR10_THR_CSV = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/Untitled spreadsheet - cifar10 - thr - v3.csv"
 
 EXPORT_DIR = "/Users/yi-chunchen/workspace/WNN_early_exit/plot/optimal_selection"
